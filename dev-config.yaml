@@ -1,0 +1,78 @@
+# Development configuration for Temporal server start-dev
+# This file configures the development server to work with our CrateDB manager
+
+# Server configuration
+server:
+  # Allow non-deterministic operations in development
+  rpc:
+    grpcPort: 7233
+    membershipPort: 6933
+    bindOnLocalHost: true
+
+  # Web UI configuration
+  web:
+    port: 8233
+    bindOnLocalHost: true
+
+# Persistence configuration for development
+persistence:
+  defaultStore: default
+  visibilityStore: visibility
+  numHistoryShards: 4
+  datastores:
+    default:
+      driver: "sqlite3"
+      datasource: "temporal.db"
+    visibility:
+      driver: "sqlite3"
+      datasource: "temporal_visibility.db"
+
+# Global configuration
+global:
+  membership:
+    maxJoinDuration: 30s
+    broadcastAddress: "127.0.0.1"
+  pprof:
+    port: 7936
+
+# Services configuration
+services:
+  frontend:
+    rpc:
+      grpcPort: 7233
+      membershipPort: 6933
+      bindOnIP: "127.0.0.1"
+
+  matching:
+    rpc:
+      grpcPort: 7235
+      membershipPort: 6935
+      bindOnIP: "127.0.0.1"
+
+  history:
+    rpc:
+      grpcPort: 7234
+      membershipPort: 6934
+      bindOnIP: "127.0.0.1"
+
+  worker:
+    rpc:
+      grpcPort: 7239
+      membershipPort: 6939
+      bindOnIP: "127.0.0.1"
+
+# Development-specific settings
+development:
+  # Disable some restrictions for easier development
+  enableWorkflowShadowing: false
+
+  # Logging configuration
+  log:
+    stdout: true
+    level: "info"
+    format: "pretty"
+
+# Dynamic configuration
+dynamicConfigClient:
+  filepath: "config/dynamicconfig/development.yaml"
+  pollInterval: "10s"

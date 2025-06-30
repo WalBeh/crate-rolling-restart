@@ -1,0 +1,716 @@
+# CrateDB Kubernetes Cluster Manager with Temporal
+
+A robust, production-ready tool for managing CrateDB cluster restarts in Kubernetes using Temporal workflows for reliability, observability, and fault tolerance.
+
+## Features
+
+- **Temporal Workflows**: Reliable, fault-tolerant cluster restart operations with built-in retry logic
+- **Sequential Pod Restarts**: Safely restart pods one at a time with health checks between each restart
+- **Prestop Hook Detection**: Automatically detects and respects decommissioning utilities in prestop hooks
+- **Health Monitoring**: Continuous cluster health monitoring during restart operations
+- **Multiple Output Formats**: Support for text, JSON, and YAML output formats
+- **Async Execution**: Start long-running workflows asynchronously and monitor progress
+- **Comprehensive Logging**: Detailed logging with configurable levels
+- **Dry Run Mode**: Preview what would be done without making actual changes
+
+## Architecture
+
+The application is built using Temporal workflows to ensure reliability and observability:
+
+### Components
+
+- **CLI Client** (`cli.py`): Command-line interface that starts workflows
+- **Temporal Worker** (`worker.py`): Processes workflows and activities
+- **Activities** (`activities.py`): Atomic operations (discover clusters, restart pods, check health)
+- **Workflows** (`workflows.py`): Orchestrate activities with proper error handling
+- **Models** (`models.py`): Data structures for workflow inputs/outputs
+- **Temporal Client** (`temporal_client.py`): Client for executing workflows
+
+### Workflow Architecture
+
+```
+MultiClusterRestartWorkflow
+├── ClusterDiscoveryActivity
+├── For each cluster:
+│   └── ClusterRestartWorkflow
+│       ├── ClusterValidationActivity
+│       ├── For each pod:
+│       │   ├── RestartPodActivity
+│       │   └── HealthCheckActivity
+│       └── FinalHealthCheckActivity
+```
+
+## Quick Start
+
+Get up and running in 5 minutes:
+
+```bash
+# 1. Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Clone and setup the project
+git clone <repository-url>
+cd rr
+./scripts/setup.sh
+
+# 3. Start Temporal development server
+temporal server start-dev
+
+# 4. Start the worker (in another terminal)
+uv run python -m rr.worker
+
+# 5. Run your first restart (in another terminal)
+uv run rr --context your-k8s-context cluster-name
+```
+
+## Prerequisites
+
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/) - Fast Python package manager
+- [Temporal CLI](https://docs.temporal.io/cli) - For running `temporal server start-dev`
+- Access to a Kubernetes cluster with CrateDB operator installed
+
+## Installation
+
+### 1. Install Prerequisites
+
+Install uv and Temporal CLI:
+
+```bash
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install Temporal CLI
+# On macOS
+brew install temporal
+
+# On Linux
+curl -sSf https://temporal.download/cli.sh | sh
+
+# On Windows
+scoop install temporal
+```
+
+### 2. Set up the project
+
+Clone and set up the project:
+
+```bash
+cd rr
+
+# Create virtual environment and install dependencies
+uv sync
+
+# Install the package in development mode
+uv pip install -e .
+```
+
+### 3. Start Temporal development server
+
+```bash
+# Start Temporal in development mode (simple single-process server)
+temporal server start-dev
+
+# This will start:
+# - Temporal server on localhost:7233
+# - Web UI on localhost:8233
+# - Uses local SQLite database
+```
+
+### 4. Start the worker
+
+```bash
+# In another terminal, start the worker
+uv run python -m rr.worker
+```
+
+## Setup Verification
+
+Before using the application, verify your setup is working correctly:
+
+```bash
+# Run the setup verification script
+uv run python tests/test_setup.py
+```
+
+This script will:
+- Test module imports
+- Verify Temporal connection
+- Test worker functionality
+- Execute a sample workflow
+
+If all tests pass, your setup is ready for use.
+
+## Usage
+
+### Basic Commands
+
+All commands require the `--context` flag to specify the Kubernetes context:
+
+```bash
+# Restart specific clusters
+uv run rr --context prod cluster1 cluster2
+
+# Restart all clusters (with confirmation)
+uv run rr --context prod all
+
+# Dry run to see what would be done
+uv run rr --context prod --dry-run cluster1
+
+# Start restart asynchronously
+uv run rr --context prod --async cluster1
+```
+
+### Command Options
+
+```bash
+uv run rr [OPTIONS] CLUSTER_NAMES...
+
+Options:
+  --kubeconfig PATH          Path to kubeconfig file
+  --context TEXT             Kubernetes context to use (REQUIRED)
+  --dry-run                  Only show what would be done
+  --skip-hook-warning        Skip warning about missing prestop hook
+  --output-format [text|json|yaml]  Output format for the report
+  --log-level [DEBUG|INFO|WARNING|ERROR|CRITICAL]  Log level
+  --temporal-address TEXT    Temporal server address [default: localhost:7233]
+  --task-queue TEXT          Temporal task queue name [default: cratedb-operations]
+  --async                    Start workflow asynchronously
+```
+
+### Workflow Management
+
+```bash
+# Check workflow status
+uv run rr status <workflow-id>
+
+# List recent workflows
+uv run rr list-workflows --limit 20
+
+# Cancel a running workflow
+uv run rr cancel <workflow-id>
+```
+
+### Environment Variables
+
+Create a `.env` file in your project root:
+
+```bash
+# .env
+TEMPORAL_ADDRESS=localhost:7233
+TEMPORAL_TASK_QUEUE=cratedb-operations
+K8S_CONTEXT=prod
+KUBECONFIG=/path/to/your/kubeconfig
+```
+
+Load environment variables:
+```bash
+# uv automatically loads .env files
+uv run rr --context prod cluster1
+```
+
+## Development Setup
+
+### 1. Development Environment
+
+```bash
+# Clone the repository
+git clone <repository-url>
+cd rr
+
+# Create development environment with all dependencies
+uv sync --dev
+
+# Install pre-commit hooks
+uv run pre-commit install
+```
+
+### 2. Project Structure
+
+```
+rr/
+├── pyproject.toml          # Project configuration with uv
+├── uv.lock                 # Lockfile for reproducible builds
+├── tests/                  # Test files
+│   ├── test_setup.py       # Setup verification script
+│   ├── test_worker.py      # Simple test worker
+│   ├── test_discovery.py   # Cluster discovery tests
+│   └── test_restart_workflow.py # Restart workflow tests
+├── .env                    # Environment variables (gitignored)
+├── rr/
+│   ├── __init__.py
+│   ├── cli.py              # Click CLI commands
+│   ├── main.py             # Entry point
+│   ├── models.py           # Data models
+│   ├── activities.py       # Temporal activities
+│   ├── workflows.py        # Temporal workflows
+│   ├── worker.py           # Temporal worker
+│   ├── temporal_client.py  # Temporal client
+│   └── kubeconfig.py       # Kubernetes config
+├── tests/                  # Test files
+└── README.md
+```
+
+### 3. Running Tests
+
+```bash
+# Run all tests
+uv run pytest
+
+# Run tests with coverage
+uv run pytest --cov=rr --cov-report=html
+
+# Run specific test file
+uv run pytest tests/test_activities.py
+
+# Run with verbose output
+uv run pytest -v
+```
+
+### 4. Code Quality
+
+```bash
+# Format code
+uv run ruff format .
+
+# Lint code
+uv run ruff check .
+
+# Fix linting issues automatically
+uv run ruff check --fix .
+
+# Type checking
+uv run mypy rr/
+```
+
+### 5. Development Commands
+
+```bash
+# Start worker in development mode
+uv run python -m rr.worker --log-level DEBUG
+
+# Run CLI in development mode
+uv run python -m rr.cli --context dev --dry-run cluster1
+
+# Access Temporal UI (built into temporal server start-dev)
+# Visit http://localhost:8233 in your browser
+```
+
+## Configuration
+
+### Temporal Configuration
+
+For development, the defaults work with `temporal server start-dev`:
+
+```bash
+# Development (default settings)
+temporal server start-dev  # Starts on localhost:7233
+
+# Using environment variables for different setups
+export TEMPORAL_ADDRESS=localhost:7233  # Default for dev server
+export TEMPORAL_TASK_QUEUE=cratedb-operations
+
+# Or using CLI flags for remote servers
+uv run rr --temporal-address your-server:7233 --context prod cluster1
+```
+
+### Kubernetes Configuration
+
+The tool uses standard Kubernetes configuration resolution:
+1. `--kubeconfig` parameter
+2. `KUBECONFIG` environment variable (note: if multiple configs, use first one)
+3. Default `~/.kube/config`
+
+### Worker Configuration
+
+```bash
+# Start worker with custom configuration
+uv run python -m rr.worker \
+  --temporal-address localhost:7233 \
+  --task-queue cratedb-operations \
+  --log-level INFO
+
+# For development with temporal server start-dev
+uv run python -m rr.worker  # Uses defaults
+```
+
+## Development vs Production
+
+### Development Setup
+
+For development, use `temporal server start-dev`:
+
+```bash
+# Terminal 1: Start Temporal development server
+temporal server start-dev
+
+# Terminal 2: Start worker
+uv run python -m rr.worker
+
+# Terminal 3: Test the CLI
+uv run rr --context dev --dry-run test-cluster
+```
+
+### Production Deployment
+
+For production, use a proper Temporal cluster:
+
+```bash
+# Connect to existing Temporal cluster
+export TEMPORAL_ADDRESS=your-temporal-cluster:7233
+uv run python -m rr.worker
+```
+
+### Production Build
+
+```bash
+# Create production build
+uv build
+
+# Install from wheel
+uv pip install dist/*.whl
+```
+
+### Production Installation
+
+Install the package for production use:
+
+```bash
+# Create production build
+uv build
+
+# Install from wheel
+uv pip install dist/*.whl
+
+# Run worker with production Temporal
+TEMPORAL_ADDRESS=temporal:7233 python -m rr.worker
+```
+
+## How It Works
+
+### Cluster Discovery
+
+1. Searches for CrateDB Custom Resources in Kubernetes
+2. Finds corresponding StatefulSets using multiple naming patterns
+3. Analyzes prestop hooks for decommissioning utilities
+4. Discovers pods using label selectors and owner references
+
+### Restart Process
+
+1. **Validation**: Checks cluster health and configuration
+2. **Sequential Restart**: Restarts pods one at a time
+3. **Health Monitoring**: Waits for each pod to be ready
+4. **Cluster Health**: Verifies cluster health between pod restarts
+5. **Final Verification**: Ensures cluster is healthy after all restarts
+
+### Prestop Hook Handling
+
+The tool automatically detects and respects prestop hooks:
+- Detects decommissioning utilities (`dc_util`, `dc-util`)
+- Extracts timeout values from command arguments
+- Adjusts pod restart timeouts accordingly
+- Warns about clusters without proper prestop hooks
+
+## Output Formats
+
+### Text Format (Default)
+Human-readable tables with summary and details.
+
+### JSON Format
+```bash
+uv run rr --context prod --output-format json cluster1
+```
+
+### YAML Format
+```bash
+uv run rr --context prod --output-format yaml cluster1
+```
+
+## Error Handling and Reliability
+
+### Temporal Benefits
+
+- **Durability**: Workflows survive worker restarts
+- **Retries**: Automatic retry of failed activities
+- **Visibility**: Full execution history and current state
+- **Timeouts**: Configurable timeouts for all operations
+
+### Failure Recovery
+
+- Individual pod restart failures don't fail the entire workflow
+- Health check failures stop the restart process safely
+- Partial restart states are preserved and recoverable
+- Comprehensive error reporting with context
+
+### Monitoring
+
+- Real-time workflow status through Temporal UI
+- Structured logging with correlation IDs
+- Progress tracking for long-running operations
+- Detailed error messages with troubleshooting context
+
+## Examples
+
+### Basic Usage
+
+```bash
+# Restart a single cluster
+uv run rr --context prod my-cluster
+
+# Restart multiple clusters
+uv run rr --context prod cluster1 cluster2 cluster3
+
+# Restart all clusters with confirmation
+uv run rr --context prod all
+
+# Dry run to preview changes
+uv run rr --context prod --dry-run my-cluster
+```
+
+### Advanced Usage
+
+```bash
+# Use specific kubeconfig and context
+uv run rr --kubeconfig ~/.kube/prod-config --context prod-cluster my-cluster
+
+# Start async with JSON output
+uv run rr --context prod --async --output-format json my-cluster
+
+# Debug mode with detailed logging
+uv run rr --context prod --log-level DEBUG my-cluster
+
+# Skip prestop hook warnings
+uv run rr --context prod --skip-hook-warning legacy-cluster
+```
+
+### Workflow Management
+
+```bash
+# Start async restart
+uv run rr --context prod --async my-cluster
+# Output: Workflow ID: restart-clusters-2024-01-15T10:30:00
+
+# Check status
+uv run rr status restart-clusters-2024-01-15T10:30:00
+
+# List recent workflows
+uv run rr list-workflows --limit 5
+
+# Cancel if needed
+uv run rr cancel restart-clusters-2024-01-15T10:30:00
+```
+
+### Using Scripts
+
+Create convenience scripts:
+
+```bash
+# scripts/restart-prod.sh
+#!/bin/bash
+export K8S_CONTEXT=prod
+uv run rr --context prod "$@"
+
+# scripts/restart-staging.sh
+#!/bin/bash
+export K8S_CONTEXT=staging
+uv run rr --context staging "$@"
+```
+
+Make executable and use:
+```bash
+chmod +x scripts/*.sh
+./scripts/restart-prod.sh cluster1 cluster2
+./scripts/restart-staging.sh --dry-run all
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **No clusters found**
+   - Check if CrateDB operator is installed
+   - Verify cluster names and namespaces
+   - Use `--log-level DEBUG` for detailed discovery information
+
+2. **Temporal connection failed**
+   - Ensure Temporal server is running
+   - Check `--temporal-address` parameter
+   - Verify network connectivity
+
+3. **Pod restart timeouts**
+   - Check if prestop hooks are taking too long
+   - Review pod resource limits
+   - Verify cluster health before restart
+
+4. **Health check failures**
+   - Check CrateDB cluster status
+   - Review cluster logs for errors
+   - Ensure sufficient cluster resources
+
+5. **Worker fails with "datetime.now restricted" error**
+   - This indicates a module is calling `datetime.now()` during workflow validation
+   - Check for imports that might load modules with datetime calls (like loguru)
+   - Ensure CLI or other non-workflow modules aren't imported in `__init__.py`
+   - Use `workflow.unsafe.imports_passed_through()` for necessary imports
+
+### Debug Mode
+
+Enable debug logging for detailed troubleshooting:
+```bash
+uv run rr --context prod --log-level DEBUG my-cluster
+```
+
+This provides:
+- Detailed cluster discovery process
+- Pod restart step-by-step logging
+- Health check details
+- Prestop hook analysis
+- Kubernetes API call traces
+
+### Development Debugging
+
+```bash
+# First, always verify your setup
+uv run python tests/test_setup.py
+
+# Test minimal worker
+uv run python tests/test_worker.py
+
+# Run with Python debugger
+uv run python -m pdb -m rr.cli --context dev cluster1
+
+# Enable asyncio debug mode
+uv run python -X dev -m rr.cli --context dev cluster1
+
+# Check Temporal Web UI
+open http://localhost:8233
+
+# View workflow history and debugging info
+temporal workflow list --limit 10
+temporal workflow show --workflow-id your-workflow-id
+```
+
+## Contributing
+
+### Development Workflow
+
+1. **Setup development environment**:
+   ```bash
+   uv sync --dev
+   uv run pre-commit install
+   ```
+
+2. **Make changes and test**:
+   ```bash
+   uv run pytest
+   uv run ruff check .
+   uv run mypy rr/
+   ```
+
+3. **Submit changes**:
+   ```bash
+   git add .
+   git commit -m "feat: add new feature"
+   git push
+   ```
+
+### Adding Dependencies
+
+```bash
+# Add runtime dependency
+uv add requests
+
+# Add development dependency
+uv add --dev pytest
+
+# Add optional dependency
+uv add --optional monitoring prometheus-client
+```
+
+### Updating Dependencies
+
+```bash
+# Update all dependencies
+uv sync --upgrade
+
+# Update specific dependency
+uv sync --upgrade requests
+```
+
+## Performance Tuning
+
+### Worker Configuration
+
+```bash
+# Adjust worker concurrency
+uv run python -m rr.worker \
+  --max-concurrent-activities 20 \
+  --max-concurrent-workflows 50
+```
+
+### Temporal Optimization
+
+```python
+# In worker.py, adjust worker settings
+worker = Worker(
+    client,
+    task_queue=task_queue,
+    max_concurrent_activities=50,
+    max_concurrent_workflow_tasks=100,
+    max_concurrent_local_activities=20,
+)
+```
+
+## Security
+
+### Production Considerations
+
+1. **Secrets Management**:
+   ```bash
+   # Use environment variables for sensitive data
+   export TEMPORAL_ADDRESS=secure-temporal:7233
+   export KUBECONFIG=/secure/path/to/kubeconfig
+   ```
+
+2. **Network Security**:
+   - Use TLS for Temporal connections
+   - Restrict network access to Temporal server
+   - Use Kubernetes RBAC for cluster access
+
+3. **Authentication**:
+   - Configure Temporal authentication
+   - Use service accounts for Kubernetes access
+   - Rotate credentials regularly
+
+## Development Tips
+
+### Quick Development Setup
+
+```bash
+# Complete setup for new development environment
+curl -LsSf https://astral.sh/uv/install.sh | sh  # Install uv
+brew install temporal  # Install Temporal CLI (macOS)
+git clone <repo> && cd rr  # Clone project
+uv sync && uv pip install -e .  # Setup Python environment
+temporal server start-dev  # Start Temporal (Terminal 1)
+uv run python -m rr.worker  # Start worker (Terminal 2)
+```
+
+### Why uv?
+
+- **Speed**: 10-100x faster than pip for package resolution and installation
+- **Reliability**: Deterministic dependency resolution with lockfiles
+- **Compatibility**: Works with existing Python packaging standards
+- **Modern**: Built with Rust for performance and reliability
+
+### Why temporal server start-dev?
+
+- **Simplicity**: Single command to start Temporal server
+- **No Docker**: No need for Docker containers or complex setup during development
+- **Built-in UI**: Web UI available at http://localhost:8233
+- **Easy Reset**: Just restart the command to reset state
+- **Fast Development**: Optimized for development workflows with immediate feedback
+
+## License
+
+Apache License 2.0 - See LICENSE file for details
