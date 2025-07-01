@@ -17,6 +17,8 @@ with workflow.unsafe.imports_passed_through():
         ClusterValidationInput,
         CrateDBCluster,
         HealthCheckInput,
+        MaintenanceWindowCheckInput,
+        MaintenanceWindowCheckResult,
         MultiClusterRestartInput,
         MultiClusterRestartResult,
         PodRestartInput,
@@ -28,6 +30,17 @@ with workflow.unsafe.imports_passed_through():
 @workflow.defn
 class ClusterRestartWorkflow:
     """Workflow for restarting a single CrateDB cluster."""
+
+    def __init__(self):
+        self.force_restart_signal = False
+        self.force_restart_reason = ""
+
+    @workflow.signal
+    def force_restart(self, reason: str = "Operator override"):
+        """Signal to force restart outside maintenance window."""
+        self.force_restart_signal = True
+        self.force_restart_reason = reason
+        workflow.logger.info(f"Operator override received: {reason}")
 
     @workflow.run
     async def run(self, cluster: CrateDBCluster, options: RestartOptions) -> RestartResult:
@@ -46,7 +59,67 @@ class ClusterRestartWorkflow:
         
         workflow.logger.info(f"Starting restart workflow for cluster {cluster.name}")
         
+        # Reset override flag for this run
+        self.force_restart_signal = False
+        self.force_restart_reason = ""
+        
         try:
+            # Check maintenance window (unless explicitly ignored)
+            if not options.ignore_maintenance_windows and options.maintenance_config_path:
+                maintenance_result = await workflow.execute_activity(
+                    CrateDBActivities.check_maintenance_window,
+                    MaintenanceWindowCheckInput(
+                        cluster_name=cluster.name,
+                        current_time=workflow.now(),
+                        config_path=options.maintenance_config_path
+                    ),
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(
+                        initial_interval=timedelta(seconds=1),
+                        maximum_interval=timedelta(seconds=10),
+                        maximum_attempts=3,
+                    ),
+                )
+                
+                workflow.logger.info(f"Maintenance window check for {cluster.name}: {maintenance_result.reason}")
+                
+                if maintenance_result.should_wait:
+                    # Wait for maintenance window or operator signal
+                    workflow.logger.warning(f"Cluster {cluster.name} is OUTSIDE its maintenance window - restart delayed: {maintenance_result.reason}")
+                    
+                    # Wait for either maintenance window or operator override
+                    while True:
+                        # Check for force restart signal first
+                        if self.force_restart_signal:
+                            workflow.logger.info(f"Proceeding with restart due to operator override: {self.force_restart_reason}")
+                            break
+                        
+                        # Check maintenance window periodically
+                        maintenance_check = await workflow.execute_activity(
+                            CrateDBActivities.check_maintenance_window,
+                            MaintenanceWindowCheckInput(
+                                cluster_name=cluster.name,
+                                current_time=workflow.now(),
+                                config_path=options.maintenance_config_path
+                            ),
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=RetryPolicy(
+                                initial_interval=timedelta(seconds=1),
+                                maximum_interval=timedelta(seconds=10),
+                                maximum_attempts=3,
+                            ),
+                        )
+                        
+                        if not maintenance_check.should_wait:
+                            workflow.logger.info(f"Maintenance window now open for {cluster.name}: {maintenance_check.reason}")
+                            break
+                        
+                        # Log that we're still waiting outside maintenance window
+                        workflow.logger.info(f"Cluster {cluster.name} still outside maintenance window, waiting 5 more minutes...")
+                        
+                        # Wait 5 minutes before checking again
+                        await workflow.sleep(300)
+            
             # Validate cluster before restart
             validation_result = await workflow.execute_activity(
                 CrateDBActivities.validate_cluster,
@@ -79,6 +152,39 @@ class ClusterRestartWorkflow:
             # Log validation warnings
             for warning in validation_result.warnings:
                 workflow.logger.warning(f"Cluster {cluster.name}: {warning}")
+            
+            # Check initial cluster health before starting any pod restarts
+            workflow.logger.info(f"Checking initial cluster health for {cluster.name}")
+            initial_health_result = await workflow.execute_activity(
+                CrateDBActivities.check_cluster_health,
+                HealthCheckInput(
+                    cluster=cluster,
+                    dry_run=options.dry_run,
+                    timeout=options.health_check_timeout,
+                ),
+                start_to_close_timeout=timedelta(seconds=options.health_check_timeout + 30),
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(seconds=10),
+                    maximum_interval=timedelta(seconds=30),
+                    maximum_attempts=30,  # Give cluster plenty of time to reach GREEN
+                ),
+            )
+            
+            if not initial_health_result.is_healthy:
+                error_msg = f"Initial health check failed: {initial_health_result.health_status}. Cluster must be GREEN before starting restart."
+                workflow.logger.error(error_msg)
+                return RestartResult(
+                    cluster=cluster,
+                    success=False,
+                    duration=(workflow.now() - start_time).total_seconds(),
+                    restarted_pods=[],
+                    total_pods=len(cluster.pods),
+                    error=error_msg,
+                    started_at=start_time,
+                    completed_at=workflow.now(),
+                )
+            
+            workflow.logger.info(f"Initial cluster health is {initial_health_result.health_status}, proceeding with pod restarts")
             
             # Calculate timeouts based on cluster configuration
             pod_restart_timeout = options.pod_ready_timeout
@@ -151,7 +257,7 @@ class ClusterRestartWorkflow:
                         retry_policy=RetryPolicy(
                             initial_interval=timedelta(seconds=10),
                             maximum_interval=timedelta(seconds=30),
-                            maximum_attempts=5,  # More retries for health checks
+                            maximum_attempts=30,  # Give cluster plenty of time to reach GREEN
                         ),
                     )
                     
@@ -184,7 +290,7 @@ class ClusterRestartWorkflow:
                 retry_policy=RetryPolicy(
                     initial_interval=timedelta(seconds=10),
                     maximum_interval=timedelta(seconds=30),
-                    maximum_attempts=5,
+                    maximum_attempts=30,  # Give cluster plenty of time to reach GREEN
                 ),
             )
             

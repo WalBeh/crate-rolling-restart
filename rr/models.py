@@ -35,6 +35,8 @@ class RestartOptions(BaseModel):
     log_level: str = "INFO"
     pod_ready_timeout: int = 300
     health_check_timeout: int = 300
+    maintenance_config_path: Optional[str] = None
+    ignore_maintenance_windows: bool = False
 
 
 class RestartResult(BaseModel):
@@ -139,3 +141,22 @@ class ClusterValidationResult(BaseModel):
     is_valid: bool
     warnings: List[str] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
+
+
+class MaintenanceWindowCheckInput(BaseModel):
+    """Input for maintenance window check activity."""
+    
+    cluster_name: str
+    current_time: Optional[datetime] = None
+    config_path: Optional[str] = None
+
+
+class MaintenanceWindowCheckResult(BaseModel):
+    """Result of maintenance window check activity."""
+    
+    cluster_name: str
+    should_wait: bool
+    reason: str
+    next_window_start: Optional[datetime] = None
+    current_time: datetime
+    in_maintenance_window: bool = False

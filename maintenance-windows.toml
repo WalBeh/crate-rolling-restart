@@ -1,0 +1,82 @@
+# Maintenance Windows Configuration
+# All times are in UTC
+
+[aqua-darth-vader]
+timezone = "UTC"
+min_window_duration = 30 # Minimum minutes needed for maintenance
+
+[[aqua-darth-vader.windows]]
+time = "18:00-24:00"
+weekdays = ["mon", "tue", "wed"]
+description = "Evening maintenance window"
+
+[[aqua-darth-vader.windows]]
+time = "17:00-21:00"
+ordinal_days = ["2nd tue", "3rd mon"]
+description = "Monthly maintenance slots"
+
+[tgw-x]
+timezone = "UTC"
+min_window_duration = 30
+
+[[tgw-x.windows]]
+time = "18:00-19:30"
+weekdays = ["mon", "tue"]
+description = "Short evening window"
+
+[[tgw-x.windows]]
+time = "20:00-22:00"
+weekdays = ["thu", "fri"]
+description = "Late evening window"
+
+[production-cluster]
+timezone = "UTC"
+min_window_duration = 60
+
+[[production-cluster.windows]]
+time = "02:00-04:00"
+weekdays = ["sat", "sun"]
+description = "Weekend early morning maintenance"
+
+[[production-cluster.windows]]
+time = "23:00-01:00"
+ordinal_days = ["last fri"]
+description = "End of month maintenance"
+
+[development-cluster]
+timezone = "UTC"
+min_window_duration = 15
+
+[[development-cluster.windows]]
+time = "12:00-13:00"
+weekdays = ["mon", "tue", "wed", "thu", "fri"]
+description = "Lunch break maintenance"
+
+[[development-cluster.windows]]
+time = "09:00-10:00"
+ordinal_days = ["1st mon"]
+description = "First Monday of month"
+
+[staging-cluster]
+timezone = "UTC"
+min_window_duration = 45
+
+[[staging-cluster.windows]]
+time = "01:00-03:00"
+weekdays = ["wed"]
+description = "Mid-week early morning"
+
+[[staging-cluster.windows]]
+time = "22:00-23:30"
+ordinal_days = ["2nd thu", "4th thu"]
+description = "Bi-weekly Thursday evening"
+
+
+[lime-wicket-systri-warrick]
+timezone = "UTC"
+min_windows_duration = 15
+
+[[lime-wicket-systri-warrick.windows]]
+time = "23:00-23:55"
+weekdays = ["mon", "tue", "wed", "thu", "fri"]
+description = "Weekly maintenance window"

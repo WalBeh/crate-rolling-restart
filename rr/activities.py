@@ -4,6 +4,7 @@ Temporal activities for CrateDB Kubernetes operations.
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from kubernetes import client
@@ -11,6 +12,7 @@ from kubernetes.client.exceptions import ApiException
 from temporalio import activity
 
 from .kubeconfig import KubeConfigHandler
+from .maintenance_windows import MaintenanceWindowChecker
 from .models import (
     ClusterDiscoveryInput,
     ClusterDiscoveryResult,
@@ -19,6 +21,8 @@ from .models import (
     CrateDBCluster,
     HealthCheckInput,
     HealthCheckResult,
+    MaintenanceWindowCheckInput,
+    MaintenanceWindowCheckResult,
     PodRestartInput,
     PodRestartResult,
 )
@@ -60,13 +64,28 @@ class CrateDBActivities:
         try:
             self._ensure_kube_client(input_data.kubeconfig, input_data.context)
 
-            # Get all CrateDB CRDs
+            # Get all CrateDB resources from all namespaces
+            # CrateDB resources are namespaced, so we need to query all namespaces
             try:
-                crds = self.custom_api.list_cluster_custom_object(
-                    group="cloud.crate.io",
-                    version="v1",
-                    plural="cratedbs",
-                )
+                # Get all namespaces first
+                namespaces = self.core_v1.list_namespace()
+                all_crds = {"items": []}
+                
+                for namespace in namespaces.items:
+                    try:
+                        crds = self.custom_api.list_namespaced_custom_object(
+                            group="cloud.crate.io",
+                            version="v1",
+                            namespace=namespace.metadata.name,
+                            plural="cratedbs",
+                        )
+                        all_crds["items"].extend(crds.get("items", []))
+                    except ApiException as ns_e:
+                        if ns_e.status != 404:  # Ignore 404s for individual namespaces
+                            activity.logger.warning(f"Error querying namespace {namespace.metadata.name}: {ns_e}")
+                
+                crds = all_crds
+                
             except ApiException as e:
                 if e.status == 404:
                     error_msg = "CrateDB CRD not found. Is the CrateDB operator installed?"
@@ -450,16 +469,28 @@ class CrateDBActivities:
             )
 
             health = self._extract_health_status(crd)
-            is_healthy = health == "GREEN"
-
+            
             activity.logger.info(f"Cluster {cluster.name} health: {health}")
-
-            return HealthCheckResult(
-                cluster_name=cluster.name,
-                health_status=health,
-                is_healthy=is_healthy,
-                checked_at=checked_at,
-            )
+            
+            # Handle different health statuses
+            if health == "GREEN":
+                return HealthCheckResult(
+                    cluster_name=cluster.name,
+                    health_status=health,
+                    is_healthy=True,
+                    checked_at=checked_at,
+                )
+            elif health in ["UNREACHABLE", "YELLOW", "RED"]:
+                # These are temporary states that should trigger retries
+                raise Exception(f"Cluster {cluster.name} health is {health}, retrying...")
+            else:
+                # UNKNOWN or other statuses are permanent failures
+                return HealthCheckResult(
+                    cluster_name=cluster.name,
+                    health_status=health,
+                    is_healthy=False,
+                    checked_at=checked_at,
+                )
 
         except Exception as e:
             error_msg = f"Error checking cluster health: {e}"
@@ -471,4 +502,100 @@ class CrateDBActivities:
                 is_healthy=False,
                 checked_at=checked_at,
                 error=error_msg,
+            )
+
+    @activity.defn
+    async def check_maintenance_window(self, input_data: MaintenanceWindowCheckInput) -> MaintenanceWindowCheckResult:
+        """
+        Check if cluster restart should proceed based on maintenance windows.
+        
+        Args:
+            input_data: Maintenance window check input
+            
+        Returns:
+            MaintenanceWindowCheckResult with decision and reasoning
+        """
+        current_time = input_data.current_time or datetime.now(timezone.utc)
+        
+        # Ensure current_time is timezone-aware (defensive programming for Temporal serialization)
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        
+        activity.logger.info(f"Checking maintenance window for cluster {input_data.cluster_name} at {current_time}")
+        
+        try:
+            if not input_data.config_path:
+                # No maintenance config provided - proceed without restrictions
+                return MaintenanceWindowCheckResult(
+                    cluster_name=input_data.cluster_name,
+                    should_wait=False,
+                    reason="No maintenance configuration path provided - proceeding without restrictions",
+                    current_time=current_time,
+                    in_maintenance_window=False
+                )
+            
+            # Initialize maintenance window checker
+            checker = MaintenanceWindowChecker(input_data.config_path)
+            
+            # Check if currently in maintenance window
+            in_window, window_reason = checker.is_in_maintenance_window(
+                input_data.cluster_name, 
+                current_time
+            )
+            
+            # Make decision about whether to wait
+            should_wait, decision_reason = checker.should_wait_for_maintenance_window(
+                input_data.cluster_name,
+                current_time
+            )
+            
+            # Get next window start time for additional context
+            next_window_start, _ = checker.get_next_maintenance_window(
+                input_data.cluster_name,
+                current_time
+            )
+            
+            # Log with appropriate level based on decision
+            if should_wait and not in_window:
+                activity.logger.warning(f"Cluster {input_data.cluster_name} is OUTSIDE maintenance window - "
+                                      f"restart will be delayed: {decision_reason}")
+            elif in_window:
+                activity.logger.info(f"Cluster {input_data.cluster_name} is INSIDE maintenance window - "
+                                   f"restart can proceed: {decision_reason}")
+            else:
+                activity.logger.info(f"Maintenance window check for {input_data.cluster_name}: "
+                                   f"should_wait={should_wait}, in_window={in_window}, reason={decision_reason}")
+            
+            return MaintenanceWindowCheckResult(
+                cluster_name=input_data.cluster_name,
+                should_wait=should_wait,
+                reason=decision_reason,
+                next_window_start=next_window_start,
+                current_time=current_time,
+                in_maintenance_window=in_window
+            )
+            
+        except FileNotFoundError as e:
+            error_msg = f"Maintenance configuration file not found: {e}"
+            activity.logger.warning(error_msg)
+            
+            return MaintenanceWindowCheckResult(
+                cluster_name=input_data.cluster_name,
+                should_wait=False,
+                reason=f"Maintenance config file not found - proceeding without restrictions: {e}",
+                current_time=current_time,
+                in_maintenance_window=False
+            )
+            
+        except Exception as e:
+            error_msg = f"Error checking maintenance window: {e}"
+            activity.logger.error(error_msg)
+            
+            # On error, proceed with restart to avoid blocking operations
+            return MaintenanceWindowCheckResult(
+                cluster_name=input_data.cluster_name,
+                should_wait=False,
+                reason=f"Error checking maintenance windows - proceeding with restart: {e}",
+                current_time=current_time,
+                in_maintenance_window=False
             )

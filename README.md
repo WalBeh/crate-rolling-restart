@@ -5,6 +5,7 @@ A robust, production-ready tool for managing CrateDB cluster restarts in Kuberne
 ## Features
 
 - **Temporal Workflows**: Reliable, fault-tolerant cluster restart operations with built-in retry logic
+- **Maintenance Windows**: Configurable time windows for automated restart scheduling with operator override capability
 - **Sequential Pod Restarts**: Safely restart pods one at a time with health checks between each restart
 - **Prestop Hook Detection**: Automatically detects and respects decommissioning utilities in prestop hooks
 - **Health Monitoring**: Continuous cluster health monitoring during restart operations
@@ -60,7 +61,7 @@ temporal server start-dev
 uv run python -m rr.worker
 
 # 5. Run your first restart (in another terminal)
-uv run rr --context your-k8s-context cluster-name
+uv run rr restart --context your-k8s-context cluster-name
 ```
 
 ## Prerequisites
@@ -149,16 +150,16 @@ All commands require the `--context` flag to specify the Kubernetes context:
 
 ```bash
 # Restart specific clusters
-uv run rr --context prod cluster1 cluster2
+uv run rr restart --context prod cluster1 cluster2
 
 # Restart all clusters (with confirmation)
-uv run rr --context prod all
+uv run rr restart --context prod all
 
 # Dry run to see what would be done
-uv run rr --context prod --dry-run cluster1
+uv run rr restart --context prod --dry-run cluster1
 
 # Start restart asynchronously
-uv run rr --context prod --async cluster1
+uv run rr restart --context prod --async cluster1
 ```
 
 ### Command Options
@@ -189,6 +190,10 @@ uv run rr list-workflows --limit 20
 
 # Cancel a running workflow
 uv run rr cancel <workflow-id>
+
+# Force restart a workflow waiting for maintenance window
+uv run rr force-restart <workflow-id>
+uv run rr force-restart <workflow-id> --reason "Emergency maintenance required"
 ```
 
 ### Environment Variables
@@ -206,7 +211,7 @@ KUBECONFIG=/path/to/your/kubeconfig
 Load environment variables:
 ```bash
 # uv automatically loads .env files
-uv run rr --context prod cluster1
+uv run rr restart --context prod cluster1
 ```
 
 ## Development Setup
@@ -348,7 +353,7 @@ temporal server start-dev
 uv run python -m rr.worker
 
 # Terminal 3: Test the CLI
-uv run rr --context dev --dry-run test-cluster
+uv run rr restart --context dev --dry-run test-cluster
 ```
 
 ### Production Deployment
@@ -386,6 +391,171 @@ uv pip install dist/*.whl
 TEMPORAL_ADDRESS=temporal:7233 python -m rr.worker
 ```
 
+## Maintenance Windows
+
+The maintenance window feature allows you to control when cluster restarts can occur, ensuring they only happen during designated maintenance periods. This provides better control over when disruptive operations occur in production environments.
+
+### Key Features
+
+- **Flexible Scheduling**: Define maintenance windows using weekdays, specific dates, or ordinal patterns (e.g., "2nd Tuesday", "last Friday")
+- **Multiple Windows**: Configure multiple maintenance windows per cluster for different maintenance schedules
+- **Time Zones**: All times are specified in UTC for consistency across environments
+- **Minimum Duration**: Configure minimum time requirements to prevent restarts when insufficient time remains
+- **Operator Override**: Emergency restarts can be triggered outside maintenance windows via Temporal UI signals
+- **Wait Logic**: Automatically waits for the next maintenance window or proceeds if already in one
+
+### Configuration Format
+
+Maintenance windows are configured using TOML files with a clear, readable format:
+
+```toml
+# Maintenance Windows Configuration
+# All times are in UTC
+
+[cluster-name]
+timezone = "UTC"
+min_window_duration = 30  # Minimum minutes needed for maintenance
+
+# Regular weekly windows
+[[cluster-name.windows]]
+time = "18:00-24:00"
+weekdays = ["mon", "tue", "wed"]
+description = "Evening maintenance window"
+
+# Ordinal day patterns
+[[cluster-name.windows]]
+time = "02:00-04:00"
+ordinal_days = ["2nd tue", "last fri"]
+description = "Monthly maintenance slots"
+```
+
+### Supported Schedule Patterns
+
+**Weekdays**: Standard day-of-week patterns
+- `weekdays = ["mon", "tue", "wed", "thu", "fri"]`
+- `weekdays = ["sat", "sun"]` (weekends only)
+
+**Ordinal Days**: Complex scheduling patterns
+- `"1st mon"`, `"2nd tue"`, `"3rd wed"`, `"4th thu"`, `"5th fri"`
+- `"last mon"`, `"last fri"` (last occurrence in month)
+
+**Time Ranges**: 24-hour format in UTC
+- `"09:00-17:00"` (standard business hours)
+- `"23:00-01:00"` (crosses midnight)
+- `"18:00-24:00"` (evening until end of day)
+
+### Management Commands
+
+```bash
+# Create a sample configuration file
+rr maintenance create-config -o maintenance-windows.toml
+
+# Check if a cluster is in its maintenance window
+rr maintenance check maintenance-windows.toml cluster-name
+
+# Check maintenance window at specific time
+rr maintenance check maintenance-windows.toml cluster-name --time "2024-01-15T19:30:00"
+
+# List all configured maintenance windows
+rr maintenance list-windows maintenance-windows.toml
+```
+
+### Using Maintenance Windows
+
+```bash
+# Restart with maintenance window enforcement
+rr restart --context prod --maintenance-config maintenance-windows.toml cluster-name
+
+# Override maintenance windows for emergency restarts
+rr restart --context prod --ignore-maintenance-windows cluster-name
+
+# Dry run with maintenance window check
+rr restart --context prod --maintenance-config maintenance-windows.toml --dry-run cluster-name
+```
+
+### Operator Override
+
+When a restart is waiting for a maintenance window, operators can force the restart to proceed in two ways:
+
+#### Option 1: CLI Command (Recommended)
+```bash
+# Force restart with default reason
+rr force-restart <workflow-id>
+
+# Force restart with custom reason
+rr force-restart <workflow-id> --reason "Emergency maintenance required"
+
+# Example with actual workflow ID
+rr force-restart restart-cluster-name-2024-01-15T10:00:00+00:00 --reason "Critical security patch"
+```
+
+#### Option 2: Temporal UI
+1. Navigate to the running workflow in Temporal Web UI
+2. Send a signal named `force_restart` with an optional reason
+3. The workflow will immediately proceed with the restart operation
+
+#### Finding Workflow IDs
+Use the list command to find running workflows:
+```bash
+rr list-workflows
+```
+Copy the full workflow ID from the output to use with the force-restart command.
+
+### Workflow Behavior
+
+**Inside Maintenance Window**: 
+- ✅ Restart proceeds immediately
+- Logs: "Proceeding with restart: Current time is within maintenance window"
+
+**Outside Maintenance Window**:
+- ⏳ Workflow waits for next maintenance window
+- Checks every 5 minutes for window availability
+- Logs: "Waiting for maintenance window: Next window starts at 2024-01-15 18:00 UTC"
+
+**Approaching Maintenance Window**:
+- ⏳ Waits if less than `min_window_duration` minutes remaining
+- Prevents restarts that might not complete within the window
+- Logs: "Less than 30 minutes until window opens (15.0 minutes remaining)"
+
+### Example Configuration
+
+```toml
+# Production cluster - conservative schedule
+[production-cluster]
+timezone = "UTC"
+min_window_duration = 60
+
+[[production-cluster.windows]]
+time = "02:00-04:00"
+weekdays = ["sat", "sun"]
+description = "Weekend early morning maintenance"
+
+[[production-cluster.windows]]
+time = "23:00-01:00"
+ordinal_days = ["last fri"]
+description = "End of month maintenance"
+
+# Development cluster - more flexible
+[dev-cluster]
+timezone = "UTC"
+min_window_duration = 15
+
+[[dev-cluster.windows]]
+time = "12:00-13:00"
+weekdays = ["mon", "tue", "wed", "thu", "fri"]
+description = "Lunch break maintenance"
+
+# Staging cluster - bi-weekly
+[staging-cluster]
+timezone = "UTC"
+min_window_duration = 45
+
+[[staging-cluster.windows]]
+time = "22:00-23:30"
+ordinal_days = ["2nd thu", "4th thu"]
+description = "Bi-weekly Thursday evening"
+```
+
 ## How It Works
 
 ### Cluster Discovery
@@ -418,12 +588,12 @@ Human-readable tables with summary and details.
 
 ### JSON Format
 ```bash
-uv run rr --context prod --output-format json cluster1
+uv run rr restart --context prod --output-format json cluster1
 ```
 
 ### YAML Format
 ```bash
-uv run rr --context prod --output-format yaml cluster1
+uv run rr restart --context prod --output-format yaml cluster1
 ```
 
 ## Error Handling and Reliability
@@ -455,39 +625,48 @@ uv run rr --context prod --output-format yaml cluster1
 
 ```bash
 # Restart a single cluster
-uv run rr --context prod my-cluster
+uv run rr restart --context prod my-cluster
 
 # Restart multiple clusters
-uv run rr --context prod cluster1 cluster2 cluster3
+uv run rr restart --context prod cluster1 cluster2 cluster3
 
 # Restart all clusters with confirmation
-uv run rr --context prod all
+uv run rr restart --context prod all
 
 # Dry run to preview changes
-uv run rr --context prod --dry-run my-cluster
+uv run rr restart --context prod --dry-run my-cluster
+
+# Use maintenance windows
+uv run rr restart --context prod --maintenance-config maintenance-windows.toml my-cluster
+
+# Emergency restart (ignore maintenance windows)
+uv run rr restart --context prod --ignore-maintenance-windows my-cluster
 ```
 
 ### Advanced Usage
 
 ```bash
 # Use specific kubeconfig and context
-uv run rr --kubeconfig ~/.kube/prod-config --context prod-cluster my-cluster
+uv run rr restart --kubeconfig ~/.kube/prod-config --context prod-cluster my-cluster
 
 # Start async with JSON output
-uv run rr --context prod --async --output-format json my-cluster
+uv run rr restart --context prod --async --output-format json my-cluster
 
 # Debug mode with detailed logging
-uv run rr --context prod --log-level DEBUG my-cluster
+uv run rr restart --context prod --log-level DEBUG my-cluster
 
 # Skip prestop hook warnings
-uv run rr --context prod --skip-hook-warning legacy-cluster
+uv run rr restart --context prod --skip-hook-warning legacy-cluster
+
+# Combine maintenance windows with other options
+uv run rr restart --context prod --maintenance-config config.toml --async --output-format json my-cluster
 ```
 
 ### Workflow Management
 
 ```bash
 # Start async restart
-uv run rr --context prod --async my-cluster
+uv run rr restart --context prod --async my-cluster
 # Output: Workflow ID: restart-clusters-2024-01-15T10:30:00
 
 # Check status
@@ -498,6 +677,33 @@ uv run rr list-workflows --limit 5
 
 # Cancel if needed
 uv run rr cancel restart-clusters-2024-01-15T10:30:00
+
+# Force restart if waiting for maintenance window
+uv run rr force-restart restart-clusters-2024-01-15T10:30:00 --reason "Emergency fix required"
+```
+
+### Maintenance Window Override Scenario
+
+```bash
+# 1. Start restart with maintenance windows configured
+uv run rr restart --context prod --maintenance-config maintenance-windows.toml my-cluster
+# Output: Workflow started, but waiting for maintenance window...
+
+# 2. Find the waiting workflow
+uv run rr list-workflows
+# Copy the workflow ID from the output (shows "Running" status)
+
+# 3. Check why it's waiting
+uv run rr status restart-my-cluster-2024-01-15T10:30:00
+# Shows it's waiting for next maintenance window
+
+# 4. Force the restart due to emergency
+uv run rr force-restart restart-my-cluster-2024-01-15T10:30:00 --reason "Critical security patch"
+# Output: Force restart signal sent! Workflow should proceed shortly.
+
+# 5. Monitor progress
+uv run rr status restart-my-cluster-2024-01-15T10:30:00
+# Should now show the restart is proceeding
 ```
 
 ### Using Scripts
@@ -508,12 +714,12 @@ Create convenience scripts:
 # scripts/restart-prod.sh
 #!/bin/bash
 export K8S_CONTEXT=prod
-uv run rr --context prod "$@"
+uv run rr restart --context prod "$@"
 
 # scripts/restart-staging.sh
 #!/bin/bash
 export K8S_CONTEXT=staging
-uv run rr --context staging "$@"
+uv run rr restart --context staging "$@"
 ```
 
 Make executable and use:
@@ -542,6 +748,12 @@ chmod +x scripts/*.sh
    - Review pod resource limits
    - Verify cluster health before restart
 
+4. **Maintenance window issues**
+   - **Workflow stuck waiting**: Use `rr force-restart <workflow-id>` to override
+   - **Wrong timezone**: Ensure maintenance config uses UTC times
+   - **Config not found**: Check `--maintenance-config` path is correct
+   - **Window not triggering**: Use `rr maintenance check config.toml cluster-name` to debug
+
 4. **Health check failures**
    - Check CrateDB cluster status
    - Review cluster logs for errors
@@ -557,7 +769,7 @@ chmod +x scripts/*.sh
 
 Enable debug logging for detailed troubleshooting:
 ```bash
-uv run rr --context prod --log-level DEBUG my-cluster
+uv run rr restart --context prod --log-level DEBUG my-cluster
 ```
 
 This provides:

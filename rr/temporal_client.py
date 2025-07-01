@@ -169,13 +169,13 @@ class TemporalClient:
                         maximum_attempts=1,  # Don't retry the entire workflow
                     ),
                 )
-                
+
                 # Handle case where result is dict instead of Pydantic model
                 if isinstance(result, dict):
                     logger.debug(f"Restart workflow returned dict: {result}")
                     logger.debug("Converting dict to MultiClusterRestartResult")
                     from .models import MultiClusterRestartResult, RestartResult
-                    
+
                     restart_results = []
                     if 'results' in result and isinstance(result['results'], list):
                         for result_data in result['results']:
@@ -186,7 +186,7 @@ class TemporalClient:
                                     logger.error(f"Failed to convert restart result: {e}")
                             elif hasattr(result_data, '__dict__'):
                                 restart_results.append(result_data)
-                    
+
                     result = MultiClusterRestartResult(
                         results=restart_results,
                         total_clusters=result.get('total_clusters', len(restart_results)),
@@ -197,7 +197,7 @@ class TemporalClient:
                         completed_at=result.get('completed_at')
                     )
                     logger.debug(f"Converted restart result: {result}")
-                
+
                 logger.info(
                     f"Cluster restart completed: {result.successful_clusters} successful, "
                     f"{result.failed_clusters} failed out of {result.total_clusters} clusters"
@@ -220,7 +220,7 @@ class TemporalClient:
                         maximum_attempts=1,
                     ),
                 )
-                
+
                 logger.info(f"Started cluster restart workflow: {workflow_id}")
                 return handle
 
@@ -257,7 +257,7 @@ class TemporalClient:
 
             status = {
                 "workflow_id": workflow_id,
-                "status": description.status,
+                "status": self._format_workflow_status(description.status),
                 "run_id": description.run_id,
                 "start_time": description.start_time,
                 "execution_time": description.execution_time,
@@ -291,6 +291,71 @@ class TemporalClient:
             logger.error(f"Error cancelling workflow: {e}")
             raise
 
+    async def signal_workflow(self, workflow_id: str, signal_name: str, *args) -> None:
+        """
+        Send a signal to a running workflow.
+
+        Args:
+            workflow_id: Workflow ID to signal
+            signal_name: Name of the signal to send
+            *args: Arguments to pass to the signal
+        """
+        if not self.client:
+            raise RuntimeError("Client not connected. Call connect() first.")
+
+        try:
+            handle = self.client.get_workflow_handle(workflow_id)
+            await handle.signal(signal_name, *args)
+            logger.info(f"Sent signal '{signal_name}' to workflow: {workflow_id}")
+
+        except Exception as e:
+            logger.error(f"Error sending signal to workflow: {e}")
+            raise
+
+    async def force_restart_workflow(self, workflow_id: str, reason: str = "Operator override") -> None:
+        """
+        Send force_restart signal to override maintenance window restrictions.
+
+        Args:
+            workflow_id: Workflow ID to signal
+            reason: Reason for the override
+        """
+        await self.signal_workflow(workflow_id, "force_restart", reason)
+        logger.info(f"Sent force restart signal to workflow {workflow_id}: {reason}")
+
+    def _format_workflow_status(self, status) -> str:
+        """Format workflow status enum to readable string."""
+        status_str = str(status)
+        
+        # Map common status values to readable names
+        status_mapping = {
+            "WorkflowExecutionStatus.RUNNING": "Running",
+            "WorkflowExecutionStatus.COMPLETED": "Completed", 
+            "WorkflowExecutionStatus.FAILED": "Failed",
+            "WorkflowExecutionStatus.CANCELED": "Canceled",
+            "WorkflowExecutionStatus.TERMINATED": "Terminated",
+            "WorkflowExecutionStatus.CONTINUED_AS_NEW": "Continued",
+            "WorkflowExecutionStatus.TIMED_OUT": "Timed Out",
+        }
+        
+        # Return mapped name or the numeric part if mapping not found
+        if status_str in status_mapping:
+            return status_mapping[status_str]
+        elif "." in status_str:
+            return status_str.split(".")[-1].replace("_", " ").title()
+        else:
+            # Fallback to simple mapping for numeric values
+            numeric_mapping = {
+                "1": "Running",
+                "2": "Completed", 
+                "3": "Failed",
+                "4": "Canceled",
+                "5": "Terminated",
+                "6": "Continued",
+                "7": "Timed Out",
+            }
+            return numeric_mapping.get(status_str, status_str)
+
     async def list_workflows(self, limit: int = 10) -> List[dict]:
         """
         List recent workflows.
@@ -312,7 +377,7 @@ class TemporalClient:
                     "workflow_id": workflow.id,
                     "run_id": workflow.run_id,
                     "workflow_type": workflow.workflow_type,
-                    "status": workflow.status,
+                    "status": self._format_workflow_status(workflow.status),
                     "start_time": workflow.start_time,
                     "execution_time": workflow.execution_time,
                     "close_time": workflow.close_time,
