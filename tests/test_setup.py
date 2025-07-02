@@ -13,7 +13,7 @@ from temporalio.worker import Worker
 
 
 @activity.defn
-async def test_activity(message: str) -> str:
+async def simple_test_activity(message: str) -> str:
     """Simple test activity."""
     activity.logger.info(f"Test activity called with: {message}")
     return f"Activity processed: {message}"
@@ -33,7 +33,7 @@ class TestWorkflow:
         
         # Execute activity
         result = await workflow.execute_activity(
-            test_activity,
+            simple_test_activity,
             input_message,
             start_to_close_timeout=timedelta(seconds=30),
         )
@@ -45,7 +45,7 @@ class TestWorkflow:
         return f"Workflow result: {result}"
 
 
-async def test_connection():
+async def check_connection():
     """Test connection to Temporal server."""
     print("Testing connection to Temporal development server...")
     
@@ -59,7 +59,7 @@ async def test_connection():
         return None
 
 
-async def test_workflow_execution(client):
+async def check_workflow_execution(client):
     """Test workflow execution."""
     print("Testing workflow execution...")
     
@@ -97,7 +97,7 @@ async def run_worker(client, duration=5):
             client,
             task_queue="test-setup-queue",
             workflows=[TestWorkflow],
-            activities=[test_activity],
+            activities=[simple_test_activity],
         )
         
         print("✓ Worker created successfully")
@@ -122,7 +122,7 @@ async def run_worker(client, duration=5):
         return False
 
 
-async def test_imports():
+async def check_imports():
     """Test importing the main modules."""
     print("Testing module imports...")
     
@@ -156,14 +156,14 @@ async def main():
     
     # Test 1: Module imports
     print("1. Testing module imports...")
-    if not await test_imports():
+    if not await check_imports():
         print("✗ Import test failed")
         sys.exit(1)
     print("✓ All imports successful\n")
     
     # Test 2: Temporal connection
     print("2. Testing Temporal connection...")
-    client = await test_connection()
+    client = await check_connection()
     if not client:
         sys.exit(1)
     print("✓ Connection test successful\n")
@@ -184,7 +184,7 @@ async def main():
         client,
         task_queue="test-setup-queue",
         workflows=[TestWorkflow],
-        activities=[test_activity],
+        activities=[simple_test_activity],
     )
     
     worker_task = asyncio.create_task(worker.run())
@@ -193,7 +193,7 @@ async def main():
     await asyncio.sleep(1)
     
     # Execute workflow
-    workflow_success = await test_workflow_execution(client)
+    workflow_success = await check_workflow_execution(client)
     
     # Stop worker
     worker_task.cancel()

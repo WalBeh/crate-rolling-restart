@@ -64,6 +64,7 @@ class WorkerManager:
                 activities.validate_cluster,
                 activities.restart_pod,
                 activities.check_cluster_health,
+                activities.check_maintenance_window,
             ],
             # Configure worker options for development
             max_concurrent_activities=5,

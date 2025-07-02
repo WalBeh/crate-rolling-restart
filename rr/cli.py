@@ -5,13 +5,14 @@ CLI interface for CrateDB Kubernetes Manager with Temporal workflows.
 import asyncio
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 import click
 from loguru import logger
 from rich.console import Console
 from rich.table import Table
 
+from .maintenance_windows import MaintenanceWindowChecker, create_sample_config
 from .models import RestartOptions
 from .temporal_client import TemporalClient
 
@@ -173,8 +174,9 @@ def generate_report(result, output_format: str = "text") -> str:
         return temp_console.file.getvalue()
 
 
-async def async_main(cluster_names, kubeconfig, context, dry_run, skip_hook_warning, 
-                    output_format, log_level, temporal_address, task_queue, async_execution):
+async def async_main(cluster_names, kubeconfig, context, dry_run, skip_hook_warning,
+                    output_format, log_level, temporal_address, task_queue, async_execution,
+                    maintenance_config, ignore_maintenance_windows):
     """Async main function that handles the Temporal workflow execution."""
     current_log_level = setup_logging(log_level)
 
@@ -234,6 +236,8 @@ async def async_main(cluster_names, kubeconfig, context, dry_run, skip_hook_warn
             skip_hook_warning=skip_hook_warning,
             output_format=output_format,
             log_level=log_level,
+            maintenance_config_path=maintenance_config,
+            ignore_maintenance_windows=ignore_maintenance_windows,
         )
 
         # Connect to Temporal
@@ -331,7 +335,13 @@ async def async_main(cluster_names, kubeconfig, context, dry_run, skip_hook_warn
 
 @click.group(invoke_without_command=True)
 @click.pass_context
-@click.argument("cluster_names", nargs=-1)
+def cli(ctx):
+    """CrateDB Kubernetes Cluster Manager with Temporal workflows."""
+    pass
+
+
+@cli.command()
+@click.argument("cluster_names", nargs=-1, required=True)
 @click.option(
     "--kubeconfig",
     help="Path to kubeconfig file",
@@ -383,34 +393,39 @@ async def async_main(cluster_names, kubeconfig, context, dry_run, skip_hook_warn
     is_flag=True,
     help="Start workflow asynchronously and return immediately",
 )
-def cli(ctx, cluster_names, kubeconfig, context, dry_run, skip_hook_warning, 
-        output_format, log_level, temporal_address, task_queue, async_execution):
-    """CrateDB Kubernetes Cluster Manager with Temporal workflows.
+@click.option(
+    "--maintenance-config",
+    help="Path to maintenance windows configuration file (TOML format)",
+    default=None,
+    type=click.Path(exists=True),
+)
+@click.option(
+    "--ignore-maintenance-windows",
+    is_flag=True,
+    help="Ignore maintenance windows and proceed with restart immediately",
+)
+def restart(cluster_names, kubeconfig, context, dry_run, skip_hook_warning, 
+           output_format, log_level, temporal_address, task_queue, async_execution,
+           maintenance_config, ignore_maintenance_windows):
+    """Restart CrateDB clusters with Temporal workflows.
 
     CLUSTER_NAMES: Space-separated list of CrateDB cluster names to restart.
     Use 'all' to restart all clusters (requires confirmation).
-    Must specify at least one cluster name or 'all'.
-    
-    The --context flag is REQUIRED and specifies which Kubernetes context to use.
     
     Examples:
-      rr --context prod cluster1 cluster2        # Restart specific clusters
-      rr --context prod all                      # Restart all clusters (with confirmation)
-      rr --context prod --dry-run cluster1       # Show what would be done (options before cluster names)
-      rr --context prod --async cluster1         # Start restart asynchronously
-      
-    Note: All options (--dry-run, --async, etc.) must come BEFORE cluster names.
-    
-    IMPORTANT: If you intend to do a dry run, make sure --dry-run comes before cluster names!
-    The system will detect and prevent common mistakes like placing --dry-run at the end.
+      rr restart --context prod cluster1 cluster2        # Restart specific clusters
+      rr restart --context prod all                      # Restart all clusters (with confirmation)
+      rr restart --context prod --dry-run cluster1       # Show what would be done
+      rr restart --context prod --async cluster1         # Start restart asynchronously
+      rr restart --context prod --maintenance-config maintenance-windows.toml cluster1  # Use maintenance windows
+      rr restart --context prod --ignore-maintenance-windows cluster1  # Ignore maintenance windows
     """
-
-    if ctx.invoked_subcommand is None:
-        # This is the main restart command
-        asyncio.run(async_main(
-            cluster_names, kubeconfig, context, dry_run, skip_hook_warning,
-            output_format, log_level, temporal_address, task_queue, async_execution
-        ))
+    
+    asyncio.run(async_main(
+        cluster_names, kubeconfig, context, dry_run, skip_hook_warning,
+        output_format, log_level, temporal_address, task_queue, async_execution,
+        maintenance_config, ignore_maintenance_windows
+    ))
 
 
 @cli.command()
@@ -486,11 +501,11 @@ def list_workflows(limit, temporal_address, task_queue):
                     return
                 
                 table = Table(title="Recent Workflows", show_header=True, header_style="bold magenta")
-                table.add_column("Workflow ID", style="cyan")
-                table.add_column("Type", style="blue")
-                table.add_column("Status", style="green")
-                table.add_column("Start Time", style="yellow")
-                table.add_column("Duration", style="magenta")
+                table.add_column("Workflow ID", style="cyan", no_wrap=True)
+                table.add_column("Type", style="blue", max_width=25)
+                table.add_column("Status", style="green", max_width=12)
+                table.add_column("Start Time", style="yellow", max_width=20)
+                table.add_column("Duration", style="magenta", max_width=15)
                 
                 for wf in workflows:
                     duration = "Running"
@@ -501,10 +516,10 @@ def list_workflows(limit, temporal_address, task_queue):
                             duration = str(end - start)
                     
                     table.add_row(
-                        wf["workflow_id"][:40] + "..." if len(wf["workflow_id"]) > 40 else wf["workflow_id"],
+                        wf["workflow_id"],
                         wf["workflow_type"].split(".")[-1],  # Just the class name
                         wf["status"],
-                        str(wf["start_time"]),
+                        str(wf["start_time"])[:19] if wf["start_time"] else "N/A",  # Truncate timestamp
                         duration
                     )
                 
@@ -528,7 +543,7 @@ def list_workflows(limit, temporal_address, task_queue):
 @click.option(
     "--task-queue",
     default="cratedb-operations",
-    help="Temporal task queue name",
+    help="Task queue name",
     envvar="TEMPORAL_TASK_QUEUE",
 )
 def cancel(workflow_id, temporal_address, task_queue):
@@ -537,13 +552,192 @@ def cancel(workflow_id, temporal_address, task_queue):
         async with TemporalClient(temporal_address, task_queue) as temporal_client:
             try:
                 await temporal_client.cancel_workflow(workflow_id)
-                console.print(f"[green]Successfully cancelled workflow: {workflow_id}[/green]")
-                
+                console.print(f"[green]Workflow {workflow_id} cancelled successfully![/green]")
             except Exception as e:
                 console.print(f"[red]Error cancelling workflow: {e}[/red]")
                 sys.exit(1)
     
     asyncio.run(cancel_wf())
+
+
+@cli.command()
+@click.argument("workflow_id")
+@click.option(
+    "--reason",
+    default="Operator override via CLI",
+    help="Reason for forcing the restart",
+)
+@click.option(
+    "--temporal-address",
+    default="localhost:7233",
+    help="Temporal server address",
+    envvar="TEMPORAL_ADDRESS",
+)
+@click.option(
+    "--task-queue",
+    default="cratedb-operations",
+    help="Task queue name",
+    envvar="TEMPORAL_TASK_QUEUE",
+)
+def force_restart(workflow_id, reason, temporal_address, task_queue):
+    """Force restart by overriding maintenance window restrictions.
+    
+    This sends a signal to a waiting workflow to proceed with the restart
+    immediately, bypassing maintenance window restrictions.
+    
+    Examples:
+      rr force-restart abc123def456            # Force restart with default reason
+      rr force-restart abc123def456 --reason "Emergency maintenance required"
+    """
+    async def force_restart_wf():
+        async with TemporalClient(temporal_address, task_queue) as temporal_client:
+            try:
+                await temporal_client.force_restart_workflow(workflow_id, reason)
+                console.print(f"[green]Force restart signal sent to workflow {workflow_id}![/green]")
+                console.print(f"[yellow]Reason: {reason}[/yellow]")
+                console.print("\n[blue]The workflow should proceed with the restart shortly.[/blue]")
+                console.print("[dim]Use 'rr status <workflow_id>' to monitor progress.[/dim]")
+            except Exception as e:
+                console.print(f"[red]Error sending force restart signal: {e}[/red]")
+                sys.exit(1)
+    
+    asyncio.run(force_restart_wf())
+
+
+@cli.group()
+def maintenance():
+    """Maintenance window management commands.
+    
+    Examples:
+      rr maintenance create-config                # Create sample maintenance config
+      rr maintenance check config.toml cluster1  # Check maintenance window status
+      rr maintenance list-windows config.toml    # List all configured windows
+    """
+    pass
+
+
+@maintenance.command()
+@click.option(
+    "--output",
+    "-o",
+    help="Output file path for the sample configuration",
+    default="maintenance-windows.toml",
+    type=click.Path(),
+)
+def create_config(output):
+    """Create a sample maintenance windows configuration file."""
+    try:
+        create_sample_config(output)
+        console.print(f"[green]Sample maintenance configuration created: {output}[/green]")
+        console.print("\n[yellow]Edit this file to configure your maintenance windows.[/yellow]")
+        console.print("Then use --maintenance-config to apply the configuration.")
+    except Exception as e:
+        console.print(f"[red]Error creating configuration: {e}[/red]")
+        sys.exit(1)
+
+
+@maintenance.command()
+@click.argument("config_path", type=click.Path(exists=True))
+@click.argument("cluster_name")
+@click.option(
+    "--time",
+    help="Check maintenance window at specific time (ISO format, e.g., 2024-01-15T19:30:00)",
+    default=None,
+)
+def check(config_path, cluster_name, time):
+    """Check if a cluster is in its maintenance window."""
+    try:
+        checker = MaintenanceWindowChecker(config_path)
+        
+        # Parse time if provided
+        check_time = None
+        if time:
+            try:
+                check_time = datetime.fromisoformat(time.replace('Z', '+00:00'))
+            except ValueError:
+                console.print(f"[red]Invalid time format: {time}[/red]")
+                console.print("Use ISO format like: 2024-01-15T19:30:00")
+                sys.exit(1)
+        
+        # Check current status
+        in_window, reason = checker.is_in_maintenance_window(cluster_name, check_time)
+        should_wait, decision_reason = checker.should_wait_for_maintenance_window(cluster_name, check_time)
+        
+        # Display results
+        table = Table(title=f"Maintenance Window Status for {cluster_name}")
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="magenta")
+        
+        current_time_str = (check_time or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M:%S UTC")
+        table.add_row("Current Time", current_time_str)
+        table.add_row("In Maintenance Window", "✅ Yes" if in_window else "❌ No")
+        table.add_row("Should Wait", "⏳ Yes" if should_wait else "🚀 No")
+        table.add_row("Reason", reason)
+        table.add_row("Decision", decision_reason)
+        
+        # Get next window info
+        next_window, next_reason = checker.get_next_maintenance_window(cluster_name, check_time)
+        if next_window:
+            table.add_row("Next Window", next_window.strftime("%Y-%m-%d %H:%M:%S UTC"))
+        else:
+            table.add_row("Next Window", "None found in next 35 days")
+        
+        console.print(table)
+        
+    except FileNotFoundError:
+        console.print(f"[red]Configuration file not found: {config_path}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error checking maintenance window: {e}[/red]")
+        sys.exit(1)
+
+
+@maintenance.command()
+@click.argument("config_path", type=click.Path(exists=True))
+def list_windows(config_path):
+    """List all configured maintenance windows."""
+    try:
+        checker = MaintenanceWindowChecker(config_path)
+        
+        table = Table(title="Configured Maintenance Windows")
+        table.add_column("Cluster", style="cyan")
+        table.add_column("Window", style="magenta")
+        table.add_column("Schedule", style="green")
+        table.add_column("Description", style="yellow")
+        
+        for cluster_name, config in checker._configs.items():
+            if not config.windows:
+                table.add_row(cluster_name, "No windows", "-", "No maintenance windows configured")
+                continue
+                
+            for i, window in enumerate(config.windows):
+                window_id = f"Window {i+1}"
+                
+                # Build schedule description
+                schedule_parts = []
+                if window.weekdays:
+                    schedule_parts.append(f"Weekdays: {', '.join(sorted(window.weekdays))}")
+                if window.ordinal_days:
+                    schedule_parts.append(f"Ordinal: {', '.join(window.ordinal_days)}")
+                
+                schedule = "; ".join(schedule_parts) if schedule_parts else "Every day"
+                time_range = f"{window.start_time.strftime('%H:%M')}-{window.end_time.strftime('%H:%M')}"
+                
+                table.add_row(
+                    cluster_name if i == 0 else "",
+                    f"{window_id} ({time_range})",
+                    schedule,
+                    window.description or "No description"
+                )
+        
+        console.print(table)
+        
+    except FileNotFoundError:
+        console.print(f"[red]Configuration file not found: {config_path}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error listing maintenance windows: {e}[/red]")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
