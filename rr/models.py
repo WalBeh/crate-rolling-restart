@@ -22,6 +22,7 @@ class CrateDBCluster(BaseModel):
     suspended: bool = False
     crd_name: str  # The CRD resource name (metadata.name)
     dc_util_timeout: int = 720  # Default timeout for dc_util in seconds
+    min_availability: str = "PRIMARIES"  # PRIMARIES, NONE, or FULL
 
 
 class RestartOptions(BaseModel):
@@ -70,6 +71,7 @@ class ClusterDiscoveryInput(BaseModel):
     cluster_names: Optional[List[str]] = None
     kubeconfig: Optional[str] = None
     context: Optional[str] = None
+    maintenance_config_path: Optional[str] = None
 
 
 class ClusterDiscoveryResult(BaseModel):
@@ -160,3 +162,27 @@ class MaintenanceWindowCheckResult(BaseModel):
     next_window_start: Optional[datetime] = None
     current_time: datetime
     in_maintenance_window: bool = False
+
+
+class DecommissionInput(BaseModel):
+    """Input for decommission activity."""
+    
+    pod_name: str
+    namespace: str
+    cluster: CrateDBCluster
+    dry_run: bool = False
+
+
+class DecommissionResult(BaseModel):
+    """Result of decommission activity."""
+    
+    pod_name: str
+    namespace: str
+    strategy_used: str  # "kubernetes_managed" or "manual"
+    success: bool
+    duration: float
+    error: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    process_exited: bool = False  # For manual decommission
+    decommission_timeout: int = 720
