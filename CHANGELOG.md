@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2025-01-03
+
+### Added
+- State machine workflows for cluster restart operations
+- Maintenance window management with signal-based overrides
+- Dictionary access fixes for Temporal activity results
+- Comprehensive legacy code cleanup
+
+### Changed
+- Fixed AttributeError issues with activity results being accessed as objects instead of dictionaries
+- Updated state machine workflows to properly handle Temporal serialization
+- Improved error handling in MaintenanceWindowStateMachine, HealthCheckStateMachine, and ClusterRestartStateMachine
+
+### Removed
+- **BREAKING**: Removed legacy debug and test scripts:
+  - `debug_cluster.py` - Cluster inspection debug script
+  - `decommission_example.py` - Example decommission script
+  - `snippet-decommssion.py` - Code snippet file
+  - `test_health_retry_logic.py` - Legacy health check retry test
+  - `test_health_validation_fix.py` - Legacy health validation test
+  - `test_maintenance_config_integration.py` - Legacy maintenance config test
+  - `test_state_machine_implementation.py` - Legacy state machine test
+  - `validate_worker.py` - Worker validation script
+  - `verify_health_validation_fix.py` - Health validation verification script
+- Removed excessive documentation files (8 files consolidated):
+  - `HEALTH_CHECK_REGRESSION_FIX.md`
+  - `HEALTH_CHECK_RETRY_ENHANCEMENT.md`
+  - `HEALTH_VALIDATION_REGRESSION_FIX.md`
+  - `REGRESSION_FIX_SUMMARY.md`
+  - `FIXES_APPLIED_SUMMARY.md`
+  - `CLEANUP_SUMMARY.md`
+  - `COMPLETE_SOLUTION_SUMMARY.md`
+  - `UPDATED_STATE_BASED_RETRIES.md`
+
+### Fixed
+- Fixed 'dict' object has no attribute 'reason' error in maintenance window checks
+- Fixed 'dict' object has no attribute 'is_valid' error in cluster validation
+- Fixed 'dict' object has no attribute 'health_status' error in health checks
+- Fixed 'PodRestartResult' object is not subscriptable error in pod restart workflows
+
 ## [0.1.1] - 2025-01-30
 
 ### Added

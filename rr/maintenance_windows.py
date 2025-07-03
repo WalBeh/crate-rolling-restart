@@ -323,9 +323,19 @@ class MaintenanceWindowChecker:
         while current_time <= search_end:
             for i, window in enumerate(config.windows):
                 window_start = self._get_window_start_on_date(current_time.date(), window)
-                if window_start and window_start > from_time:
-                    desc = window.description or f"window {i+1}"
-                    return window_start, f"Next maintenance {desc} starts at {window_start.strftime('%Y-%m-%d %H:%M UTC')}"
+                if window_start:
+                    # Ensure both datetimes have the same timezone awareness for comparison
+                    compare_from_time = from_time
+                    if window_start.tzinfo is not None and compare_from_time.tzinfo is None:
+                        # window_start is timezone-aware, from_time is naive - make from_time UTC
+                        compare_from_time = from_time.replace(tzinfo=timezone.utc)
+                    elif window_start.tzinfo is None and compare_from_time.tzinfo is not None:
+                        # window_start is naive, from_time is timezone-aware - make window_start UTC
+                        window_start = window_start.replace(tzinfo=timezone.utc)
+                    
+                    if window_start > compare_from_time:
+                        desc = window.description or f"window {i+1}"
+                        return window_start, f"Next maintenance {desc} starts at {window_start.strftime('%Y-%m-%d %H:%M UTC')}"
             
             current_time += timedelta(days=1)
         
@@ -374,7 +384,16 @@ class MaintenanceWindowChecker:
         # Check if next maintenance window is soon (within min_window_duration)
         next_window_start, next_reason = self.get_next_maintenance_window(cluster_name, current_time)
         if next_window_start:
-            time_until_window = next_window_start - current_time
+            # Ensure both datetimes have the same timezone awareness for comparison
+            compare_current_time = current_time
+            if next_window_start.tzinfo is not None and compare_current_time.tzinfo is None:
+                # next_window_start is timezone-aware, current_time is naive - make current_time UTC
+                compare_current_time = current_time.replace(tzinfo=timezone.utc)
+            elif next_window_start.tzinfo is None and compare_current_time.tzinfo is not None:
+                # next_window_start is naive, current_time is timezone-aware - make next_window_start UTC
+                next_window_start = next_window_start.replace(tzinfo=timezone.utc)
+            
+            time_until_window = next_window_start - compare_current_time
             min_duration = timedelta(minutes=config.min_window_duration)
             
             if time_until_window <= min_duration:

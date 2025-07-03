@@ -1,10 +1,8 @@
 """
-Temporal workflows for CrateDB cluster restart operations.
+Temporal workflows for CrateDB cluster operations.
 """
 
-import asyncio
 from datetime import timedelta
-from typing import List
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -14,40 +12,36 @@ with workflow.unsafe.imports_passed_through():
     from .activities import CrateDBActivities
     from .models import (
         ClusterDiscoveryInput,
-        ClusterValidationInput,
+        ClusterDiscoveryResult,
         CrateDBCluster,
         DecommissionInput,
         DecommissionResult,
-        HealthCheckInput,
-        MaintenanceWindowCheckInput,
-        MaintenanceWindowCheckResult,
         MultiClusterRestartInput,
         MultiClusterRestartResult,
-        PodRestartInput,
         RestartOptions,
         RestartResult,
     )
+    from .state_machines import ClusterRestartStateMachine
 
 
 @workflow.defn
 class ClusterRestartWorkflow:
-    """Workflow for restarting a single CrateDB cluster."""
+    """Workflow for restarting a single CrateDB cluster using state machine approach."""
 
     def __init__(self):
         self.force_restart_signal = False
         self.force_restart_reason = ""
 
     @workflow.signal
-    def force_restart(self, reason: str = "Operator override"):
-        """Signal to force restart outside maintenance window."""
+    def force_restart(self, reason: str):
+        """Force restart signal to bypass maintenance window restrictions."""
         self.force_restart_signal = True
         self.force_restart_reason = reason
-        workflow.logger.info(f"Operator override received: {reason}")
 
     @workflow.run
     async def run(self, cluster: CrateDBCluster, options: RestartOptions) -> RestartResult:
         """
-        Restart a single CrateDB cluster.
+        Restart a single CrateDB cluster using state machine orchestration.
 
         Args:
             cluster: The cluster to restart
@@ -56,322 +50,42 @@ class ClusterRestartWorkflow:
         Returns:
             RestartResult with the outcome
         """
-        start_time = workflow.now()
-        restarted_pods = []
-
-        workflow.logger.info(f"Starting restart workflow for cluster {cluster.name}")
-
-        # Reset override flag for this run
-        self.force_restart_signal = False
-        self.force_restart_reason = ""
+        workflow.logger.info(f"Starting cluster restart workflow for {cluster.name} (using state machine)")
 
         try:
-            # Check maintenance window (unless explicitly ignored)
-            if not options.ignore_maintenance_windows and options.maintenance_config_path:
-                maintenance_result = await workflow.execute_activity(
-                    CrateDBActivities.check_maintenance_window,
-                    MaintenanceWindowCheckInput(
-                        cluster_name=cluster.name,
-                        current_time=workflow.now(),
-                        config_path=options.maintenance_config_path
-                    ),
-                    start_to_close_timeout=timedelta(seconds=30),
-                    retry_policy=RetryPolicy(
-                        initial_interval=timedelta(seconds=1),
-                        maximum_interval=timedelta(seconds=10),
-                        maximum_attempts=3,
-                    ),
-                )
-
-                workflow.logger.info(f"Maintenance window check for {cluster.name}: {maintenance_result.reason}")
-
-                if maintenance_result.should_wait:
-                    # Wait for maintenance window or operator signal
-                    workflow.logger.warning(f"Cluster {cluster.name} is OUTSIDE its maintenance window - restart delayed: {maintenance_result.reason}")
-
-                    # Wait for either maintenance window or operator override
-                    while True:
-                        # Check for force restart signal first
-                        if self.force_restart_signal:
-                            workflow.logger.info(f"Proceeding with restart due to operator override: {self.force_restart_reason}")
-                            break
-
-                        # Check maintenance window periodically
-                        maintenance_check = await workflow.execute_activity(
-                            CrateDBActivities.check_maintenance_window,
-                            MaintenanceWindowCheckInput(
-                                cluster_name=cluster.name,
-                                current_time=workflow.now(),
-                                config_path=options.maintenance_config_path
-                            ),
-                            start_to_close_timeout=timedelta(seconds=30),
-                            retry_policy=RetryPolicy(
-                                initial_interval=timedelta(seconds=1),
-                                maximum_interval=timedelta(seconds=10),
-                                maximum_attempts=3,
-                            ),
-                        )
-
-                        if not maintenance_check.should_wait:
-                            workflow.logger.info(f"Maintenance window now open for {cluster.name}: {maintenance_check.reason}")
-                            break
-
-                        # Log that we're still waiting outside maintenance window
-                        workflow.logger.info(f"Cluster {cluster.name} still outside maintenance window, waiting 5 more minutes...")
-
-                        # Wait 5 minutes before checking again
-                        await workflow.sleep(300)
-
-            # Validate cluster before restart
-            validation_result = await workflow.execute_activity(
-                CrateDBActivities.validate_cluster,
-                ClusterValidationInput(
-                    cluster=cluster,
-                    skip_hook_warning=options.skip_hook_warning
-                ),
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=RetryPolicy(
-                    initial_interval=timedelta(seconds=1),
-                    maximum_interval=timedelta(seconds=10),
-                    maximum_attempts=3,
-                ),
+            # Use cluster restart state machine for orchestrated restart
+            result = await workflow.execute_child_workflow(
+                ClusterRestartStateMachine.run,
+                args=[cluster, options],
+                id=f"cluster-restart-{cluster.name}-{workflow.now().timestamp()}",
+                task_timeout=timedelta(hours=4),  # Allow for long operations
             )
 
-            if not validation_result.is_valid:
-                error_msg = f"Cluster validation failed: {', '.join(validation_result.errors)}"
-                workflow.logger.error(error_msg)
-                return RestartResult(
-                    cluster=cluster,
-                    success=False,
-                    duration=0,
-                    restarted_pods=[],
-                    total_pods=len(cluster.pods),
-                    error=error_msg,
-                    started_at=start_time,
-                    completed_at=workflow.now(),
-                )
-
-            # Log validation warnings
-            for warning in validation_result.warnings:
-                workflow.logger.warning(f"Cluster {cluster.name}: {warning}")
-
-            # Check initial cluster health before starting any pod restarts
-            # For initial check, we only retry a few times and accept YELLOW state
-            workflow.logger.info(f"Checking initial cluster health for {cluster.name}")
-            try:
-                initial_health_result = await workflow.execute_activity(
-                    CrateDBActivities.check_cluster_health,
-                    HealthCheckInput(
-                        cluster=cluster,
-                        dry_run=options.dry_run,
-                        timeout=options.health_check_timeout,
-                    ),
-                    start_to_close_timeout=timedelta(seconds=options.health_check_timeout + 30),
-                    retry_policy=RetryPolicy(
-                        initial_interval=timedelta(seconds=10),
-                        maximum_interval=timedelta(seconds=30),
-                        maximum_attempts=3,  # Only retry a few times for initial check
-                    ),
-                )
-                workflow.logger.info(f"Initial cluster health is GREEN, proceeding with pod restarts")
-            except Exception:
-                # Initial health check failed (not GREEN), but we can still proceed with YELLOW
-                workflow.logger.warning(f"Initial cluster health is not GREEN, but proceeding with restart")
-                # Only block restart for RED or UNREACHABLE clusters by checking status directly
-                try:
-                    # Get cluster status without retries to check if it's safe to proceed
-                    health_check = await workflow.execute_activity(
-                        CrateDBActivities.check_cluster_health,
-                        HealthCheckInput(
-                            cluster=cluster,
-                            dry_run=options.dry_run,
-                            timeout=30,
-                        ),
-                        start_to_close_timeout=timedelta(seconds=60),
-                        retry_policy=RetryPolicy(
-                            maximum_attempts=1,  # No retries, just check current state
-                        ),
-                    )
-                    # If we got here, health is GREEN
-                    workflow.logger.info(f"Cluster health became GREEN, proceeding")
-                except Exception as e:
-                    # Extract health status from exception message to determine if we should block
-                    if "RED" in str(e) or "UNREACHABLE" in str(e):
-                        error_msg = f"Cannot restart cluster in {str(e)} state"
-                        workflow.logger.error(error_msg)
-                        return RestartResult(
-                            cluster=cluster,
-                            success=False,
-                            duration=(workflow.now() - start_time).total_seconds(),
-                            restarted_pods=[],
-                            total_pods=len(cluster.pods),
-                            error=error_msg,
-                            started_at=start_time,
-                            completed_at=workflow.now(),
-                        )
-                    else:
-                        # YELLOW, UNKNOWN - these are acceptable for starting restart
-                        workflow.logger.info(f"Cluster health is not GREEN but proceeding with restart")
-
-            # Calculate timeouts based on cluster configuration
-            pod_restart_timeout = options.pod_ready_timeout
-            if cluster.has_dc_util:
-                # Add decommission timeout plus buffer
-                pod_restart_timeout = cluster.dc_util_timeout + 120
-
-            health_check_timeout = options.health_check_timeout
-
-            workflow.logger.info(
-                f"Restarting {len(cluster.pods)} pods for cluster {cluster.name} "
-                f"(pod timeout: {pod_restart_timeout}s, health check timeout: {health_check_timeout}s)"
-            )
-
-            # Restart pods sequentially
-            for i, pod_name in enumerate(cluster.pods):
-                workflow.logger.info(f"Restarting pod {i+1}/{len(cluster.pods)}: {pod_name}")
-
-                # Restart the pod
-                pod_result = await workflow.execute_activity(
-                    CrateDBActivities.restart_pod,
-                    PodRestartInput(
-                        pod_name=pod_name,
-                        namespace=cluster.namespace,
-                        cluster=cluster,
-                        dry_run=options.dry_run,
-                        pod_ready_timeout=pod_restart_timeout,
-                    ),
-                    start_to_close_timeout=timedelta(seconds=pod_restart_timeout + 60),
-                    retry_policy=RetryPolicy(
-                        initial_interval=timedelta(seconds=5),
-                        maximum_interval=timedelta(seconds=30),
-                        maximum_attempts=2,  # Limited retries for pod restart
-                        non_retryable_error_types=["ActivityCancellationError"]
-                    ),
-                )
-
-                if not pod_result.success:
-                    error_msg = f"Failed to restart pod {pod_name}: {pod_result.error}"
-                    workflow.logger.error(error_msg)
-                    return RestartResult(
-                        cluster=cluster,
-                        success=False,
-                        duration=(workflow.now() - start_time).total_seconds(),
-                        restarted_pods=restarted_pods,
-                        total_pods=len(cluster.pods),
-                        error=error_msg,
-                        started_at=start_time,
-                        completed_at=workflow.now(),
-                    )
-
-                restarted_pods.append(pod_name)
-                workflow.logger.info(f"Successfully restarted pod {pod_name}")
-
-                # Check cluster health after each pod restart (except the last one)
-                if i < len(cluster.pods) - 1:
-                    workflow.logger.info(f"Checking cluster health after restarting pod {pod_name}")
-
-                    # Wait for cluster to stabilize
-                    await asyncio.sleep(5)
-
-                    # Check health with retries
-                    try:
-                        health_result = await workflow.execute_activity(
-                            CrateDBActivities.check_cluster_health,
-                            HealthCheckInput(
-                                cluster=cluster,
-                                dry_run=options.dry_run,
-                                timeout=health_check_timeout,
-                            ),
-                            start_to_close_timeout=timedelta(seconds=health_check_timeout + 30),
-                            retry_policy=RetryPolicy(
-                                initial_interval=timedelta(seconds=10),
-                                maximum_interval=timedelta(seconds=30),
-                                maximum_attempts=60,  # Up to 10 minutes to reach GREEN after pod restart
-                            ),
-                        )
-                        
-                        # This should not happen since health check activity retries until GREEN
-                        workflow.logger.info(f"Cluster health is GREEN after restarting pod {pod_name}")
-                        
-                    except Exception as e:
-                        error_msg = f"Cluster health check failed after restarting pod {pod_name}: {str(e)} (restarted {len(restarted_pods)}/{len(cluster.pods)} pods)"
-                        workflow.logger.error(error_msg)
-                        return RestartResult(
-                            cluster=cluster,
-                            success=False,
-                            duration=(workflow.now() - start_time).total_seconds(),
-                            restarted_pods=restarted_pods,
-                            total_pods=len(cluster.pods),
-                            error=error_msg,
-                            started_at=start_time,
-                            completed_at=workflow.now(),
-                        )
-
-            # Final health check
-            workflow.logger.info("Performing final health check")
-            try:
-                final_health_result = await workflow.execute_activity(
-                    CrateDBActivities.check_cluster_health,
-                    HealthCheckInput(
-                        cluster=cluster,
-                        dry_run=options.dry_run,
-                        timeout=health_check_timeout,
-                    ),
-                    start_to_close_timeout=timedelta(seconds=health_check_timeout + 30),
-                    retry_policy=RetryPolicy(
-                        initial_interval=timedelta(seconds=10),
-                        maximum_interval=timedelta(seconds=30),
-                        maximum_attempts=60,  # Up to 10 minutes for final health check
-                    ),
-                )
-                
-                # This should not happen since health check activity retries until GREEN
-                workflow.logger.info(f"Final cluster health is GREEN after restarting all pods")
-                
-            except Exception as e:
-                error_msg = f"Final health check failed: {str(e)}"
-                workflow.logger.error(error_msg)
-                return RestartResult(
-                    cluster=cluster,
-                    success=False,
-                    duration=(workflow.now() - start_time).total_seconds(),
-                    restarted_pods=restarted_pods,
-                    total_pods=len(cluster.pods),
-                    error=error_msg,
-                    started_at=start_time,
-                    completed_at=workflow.now(),
-                )
-
-            end_time = workflow.now()
-            duration = (end_time - start_time).total_seconds()
-
-            workflow.logger.info(f"Successfully restarted cluster {cluster.name} in {duration:.2f}s")
-
+            # Convert state machine result to RestartResult
             return RestartResult(
-                cluster=cluster,
-                success=True,
-                duration=duration,
-                restarted_pods=restarted_pods,
-                total_pods=len(cluster.pods),
-                started_at=start_time,
-                completed_at=end_time,
+                cluster=result["cluster"],
+                success=result["success"],
+                duration=result["duration"],
+                restarted_pods=result["restarted_pods"],
+                total_pods=result["total_pods"],
+                error=result.get("error"),
+                started_at=result["started_at"],
+                completed_at=result["completed_at"],
             )
 
         except Exception as e:
-            end_time = workflow.now()
-            duration = (end_time - start_time).total_seconds()
-            error_msg = f"Unexpected error during cluster restart: {e}"
+            error_msg = f"Cluster restart workflow failed for {cluster.name}: {e}"
             workflow.logger.error(error_msg)
-
+            
             return RestartResult(
                 cluster=cluster,
                 success=False,
-                duration=duration,
-                restarted_pods=restarted_pods,
+                duration=0,
+                restarted_pods=[],
                 total_pods=len(cluster.pods),
                 error=error_msg,
-                started_at=start_time,
-                completed_at=end_time,
+                started_at=workflow.now(),
+                completed_at=workflow.now(),
             )
 
 
@@ -397,7 +111,7 @@ class MultiClusterRestartWorkflow:
             # Discover clusters
             workflow.logger.info(f"Discovering clusters in restart workflow with names: {input_data.cluster_names}")
             discovery_result = await workflow.execute_activity(
-                CrateDBActivities.discover_clusters,
+                "discover_clusters",
                 ClusterDiscoveryInput(
                     cluster_names=input_data.cluster_names,
                     kubeconfig=input_data.options.kubeconfig,
@@ -406,7 +120,7 @@ class MultiClusterRestartWorkflow:
                 ),
                 start_to_close_timeout=timedelta(seconds=120),
                 retry_policy=RetryPolicy(
-                    initial_interval=timedelta(seconds=2),
+                    initial_interval=timedelta(seconds=1),
                     maximum_interval=timedelta(seconds=10),
                     maximum_attempts=3,
                 ),
@@ -552,7 +266,7 @@ class ClusterDiscoveryWorkflow:
         workflow.logger.info(f"Starting cluster discovery for: {input_data.cluster_names or 'all clusters'}")
 
         result = await workflow.execute_activity(
-            CrateDBActivities.discover_clusters,
+            "discover_clusters",
             input_data,
             start_to_close_timeout=timedelta(seconds=120),
             retry_policy=RetryPolicy(
@@ -562,8 +276,20 @@ class ClusterDiscoveryWorkflow:
             ),
         )
 
-        workflow.logger.info(f"Discovery completed: found {result.total_found} clusters")
-        return result
+        # Handle case where result might be a dict due to serialization issues
+        if isinstance(result, dict):
+            total_found = result.get('total_found', 0)
+            workflow.logger.info(f"Discovery completed: {total_found} clusters found")
+            # Convert dict back to ClusterDiscoveryResult
+            from .models import ClusterDiscoveryResult
+            return ClusterDiscoveryResult(
+                clusters=result.get('clusters', []),
+                total_found=total_found,
+                errors=result.get('errors', [])
+            )
+        else:
+            workflow.logger.info(f"Discovery completed: {result.total_found} clusters found")
+            return result
 
 
 @workflow.defn
@@ -589,7 +315,7 @@ class DecommissionWorkflow:
 
         try:
             result = await workflow.execute_activity(
-                CrateDBActivities.decommission_pod,
+                "decommission_pod",
                 decommission_input,
                 start_to_close_timeout=timedelta(seconds=activity_timeout),
                 retry_policy=RetryPolicy(

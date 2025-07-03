@@ -17,7 +17,13 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 # Use unsafe imports for temporal server start-dev compatibility
 with workflow.unsafe.imports_passed_through():
     from .activities import CrateDBActivities
-    from .workflows import ClusterDiscoveryWorkflow, ClusterRestartWorkflow, MultiClusterRestartWorkflow
+    from .workflows import ClusterDiscoveryWorkflow, ClusterRestartWorkflow, MultiClusterRestartWorkflow, DecommissionWorkflow
+    from .state_machines import (
+        HealthCheckStateMachine,
+        MaintenanceWindowStateMachine,
+        PodRestartStateMachine,
+        ClusterRestartStateMachine,
+    )
 
 
 class WorkerManager:
@@ -58,6 +64,12 @@ class WorkerManager:
                 ClusterRestartWorkflow,
                 MultiClusterRestartWorkflow,
                 ClusterDiscoveryWorkflow,
+                DecommissionWorkflow,
+                # State machine workflows
+                HealthCheckStateMachine,
+                MaintenanceWindowStateMachine,
+                PodRestartStateMachine,
+                ClusterRestartStateMachine,
             ],
             activities=[
                 activities.discover_clusters,
@@ -65,6 +77,9 @@ class WorkerManager:
                 activities.restart_pod,
                 activities.check_cluster_health,
                 activities.check_maintenance_window,
+                activities.decommission_pod,
+                activities.delete_pod,
+                activities.wait_for_pod_ready,
             ],
             # Configure worker options for development
             max_concurrent_activities=5,
