@@ -73,6 +73,8 @@ class ClusterMaintenanceConfig(BaseModel):
     windows: List[MaintenanceWindow] = Field(default_factory=list)
     timezone: str = "UTC"
     min_window_duration: int = 30  # Minimum minutes needed for maintenance
+    dc_util_timeout: int = 720  # Default timeout for dc_util in seconds
+    min_availability: str = "PRIMARIES"  # PRIMARIES, NONE, or FULL
 
 
 class MaintenanceWindowChecker:
@@ -135,7 +137,9 @@ class MaintenanceWindowChecker:
                 cluster_name=cluster_name,
                 windows=windows,
                 timezone=cluster_data.get('timezone', 'UTC'),
-                min_window_duration=cluster_data.get('min_window_duration', 30)
+                min_window_duration=cluster_data.get('min_window_duration', 30),
+                dc_util_timeout=cluster_data.get('dc_util_timeout', 720),
+                min_availability=cluster_data.get('min_availability', 'PRIMARIES')
             )
             
             self._configs[cluster_name] = config

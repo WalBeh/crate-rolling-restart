@@ -1,9 +1,18 @@
 # Maintenance Windows Configuration
 # All times are in UTC
+#
+# Optional Settings:
+# - dc_util_timeout: Timeout for decommission operations in seconds (default: 720)
+# - min_availability: Required cluster availability during decommission
+#   * PRIMARIES: Keep primary shards available (default)
+#   * FULL: Keep all shards available (safest)
+#   * NONE: Allow all shards to be unavailable (fastest)
 
 [aqua-darth-vader]
 timezone = "UTC"
-min_window_duration = 30 # Minimum minutes needed for maintenance
+min_window_duration = 30       # Minimum minutes needed for maintenance
+dc_util_timeout = 720          # Timeout for dc_util in seconds (optional, defaults to 720)
+min_availability = "PRIMARIES" # PRIMARIES, NONE, or FULL (optional, defaults to PRIMARIES)
 
 [[aqua-darth-vader.windows]]
 time = "18:00-24:00"
@@ -18,6 +27,8 @@ description = "Monthly maintenance slots"
 [tgw-x]
 timezone = "UTC"
 min_window_duration = 30
+dc_util_timeout = 900     # Custom timeout for this cluster
+min_availability = "FULL" # Require full availability
 
 [[tgw-x.windows]]
 time = "18:00-19:30"
@@ -32,6 +43,8 @@ description = "Late evening window"
 [production-cluster]
 timezone = "UTC"
 min_window_duration = 60
+dc_util_timeout = 1200         # Longer timeout for production
+min_availability = "PRIMARIES"
 
 [[production-cluster.windows]]
 time = "02:00-04:00"
@@ -46,6 +59,8 @@ description = "End of month maintenance"
 [development-cluster]
 timezone = "UTC"
 min_window_duration = 15
+dc_util_timeout = 600     # Shorter timeout for dev
+min_availability = "NONE" # Less strict for development
 
 [[development-cluster.windows]]
 time = "12:00-13:00"
@@ -60,6 +75,8 @@ description = "First Monday of month"
 [staging-cluster]
 timezone = "UTC"
 min_window_duration = 45
+dc_util_timeout = 900          # Moderate timeout for staging
+min_availability = "PRIMARIES" # Standard availability for staging
 
 [[staging-cluster.windows]]
 time = "01:00-03:00"
