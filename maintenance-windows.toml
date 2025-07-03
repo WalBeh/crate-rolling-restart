@@ -10,13 +10,13 @@
 
 [aqua-darth-vader]
 timezone = "UTC"
-min_window_duration = 30       # Minimum minutes needed for maintenance
-dc_util_timeout = 720          # Timeout for dc_util in seconds (optional, defaults to 720)
-min_availability = "PRIMARIES" # PRIMARIES, NONE, or FULL (optional, defaults to PRIMARIES)
+min_window_duration = 30  # Minimum minutes needed for maintenance
+dc_util_timeout = 333     # Timeout for dc_util in seconds (optional, defaults to 720)
+min_availability = "NONE" # PRIMARIES, NONE, or FULL (optional, defaults to PRIMARIES)
 
 [[aqua-darth-vader.windows]]
-time = "18:00-24:00"
-weekdays = ["mon", "tue", "wed"]
+time = "01:00-24:00"
+weekdays = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 description = "Evening maintenance window"
 
 [[aqua-darth-vader.windows]]

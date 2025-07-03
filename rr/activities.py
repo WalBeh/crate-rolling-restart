@@ -46,13 +46,22 @@ class CrateDBActivities:
     def _ensure_kube_client(self, kubeconfig: Optional[str] = None, context: Optional[str] = None) -> None:
         """Ensure Kubernetes client is initialized."""
         if self.kube_client is None:
-            kube_handler = KubeConfigHandler(kubeconfig)
-            kube_handler.load_context(context)
+            try:
+                kube_handler = KubeConfigHandler(kubeconfig)
+                kube_handler.load_context(context)
 
-            self.kube_client = client.ApiClient()
-            self.apps_v1 = client.AppsV1Api(self.kube_client)
-            self.core_v1 = client.CoreV1Api(self.kube_client)
-            self.custom_api = client.CustomObjectsApi(self.kube_client)
+                self.kube_client = client.ApiClient()
+                self.apps_v1 = client.AppsV1Api(self.kube_client)
+                self.core_v1 = client.CoreV1Api(self.kube_client)
+                self.custom_api = client.CustomObjectsApi(self.kube_client)
+            except Exception as e:
+                error_msg = f"Failed to initialize Kubernetes client: {e}"
+                if "ExpiredToken" in str(e) or "security token" in str(e).lower():
+                    error_msg += " - Your AWS security token appears to be expired. Please refresh your credentials."
+                elif "Unauthorized" in str(e):
+                    error_msg += " - Authentication failed. Please check your kubeconfig and credentials."
+                activity.logger.error(error_msg)
+                raise Exception(error_msg)
 
     @activity.defn
     async def discover_clusters(self, input_data: ClusterDiscoveryInput) -> ClusterDiscoveryResult:
@@ -68,7 +77,13 @@ class CrateDBActivities:
         activity.logger.info(f"Discovering CrateDB clusters: {input_data.cluster_names or 'all'}")
 
         try:
-            self._ensure_kube_client(input_data.kubeconfig, input_data.context)
+            # Initialize Kubernetes client with better error handling
+            try:
+                self._ensure_kube_client(input_data.kubeconfig, input_data.context)
+            except Exception as init_error:
+                error_msg = f"Failed to initialize Kubernetes client: {init_error}"
+                activity.logger.error(error_msg)
+                return ClusterDiscoveryResult(clusters=[], total_found=0, errors=[error_msg])
 
             # Get all CrateDB resources from all namespaces
             # CrateDB resources are namespaced, so we need to query all namespaces
@@ -87,13 +102,21 @@ class CrateDBActivities:
                         )
                         all_crds["items"].extend(crds.get("items", []))
                     except ApiException as ns_e:
-                        if ns_e.status != 404:  # Ignore 404s for individual namespaces
+                        if ns_e.status == 401:
+                            error_msg = f"Authentication failed for namespace {namespace.metadata.name}. Check your Kubernetes credentials (expired AWS token?)"
+                            activity.logger.error(error_msg)
+                            return ClusterDiscoveryResult(clusters=[], total_found=0, errors=[error_msg])
+                        elif ns_e.status != 404:  # Ignore 404s for individual namespaces
                             activity.logger.warning(f"Error querying namespace {namespace.metadata.name}: {ns_e}")
 
                 crds = all_crds
 
             except ApiException as e:
-                if e.status == 404:
+                if e.status == 401:
+                    error_msg = "Kubernetes authentication failed. Check your credentials and ensure AWS token is not expired."
+                    activity.logger.error(error_msg)
+                    return ClusterDiscoveryResult(clusters=[], total_found=0, errors=[error_msg])
+                elif e.status == 404:
                     error_msg = "CrateDB CRD not found. Is the CrateDB operator installed?"
                     activity.logger.error(error_msg)
                     return ClusterDiscoveryResult(clusters=[], total_found=0, errors=[error_msg])
@@ -115,6 +138,13 @@ class CrateDBActivities:
             activity.logger.info(f"Found {len(clusters)} CrateDB clusters")
             return ClusterDiscoveryResult(clusters=clusters, total_found=len(clusters), errors=errors)
 
+        except ApiException as e:
+            if e.status == 401:
+                error_msg = "Kubernetes authentication failed. Check your credentials and ensure AWS token is not expired."
+            else:
+                error_msg = f"Kubernetes API error: {e}"
+            activity.logger.error(error_msg)
+            return ClusterDiscoveryResult(clusters=[], total_found=0, errors=[error_msg])
         except Exception as e:
             error_msg = f"Error discovering clusters: {e}"
             activity.logger.error(error_msg)
@@ -379,7 +409,10 @@ class CrateDBActivities:
     @activity.defn
     async def restart_pod(self, input_data: PodRestartInput) -> PodRestartResult:
         """
-        Restart a single pod.
+        Restart a single pod - LEGACY METHOD for backward compatibility.
+        
+        This method is kept for backward compatibility but new code should use
+        the state machine approach via PodRestartStateMachine.
 
         Args:
             input_data: Pod restart parameters
@@ -406,89 +439,25 @@ class CrateDBActivities:
                     completed_at=None,
                 )
 
-            activity.logger.info(f"Starting decommission and restart for pod {input_data.pod_name}")
+            activity.logger.info(f"Starting legacy pod restart for {input_data.pod_name}")
 
             # CRITICAL: Validate cluster health before proceeding with pod restart
             # This prevents pods from being deleted when cluster is not GREEN
             activity.logger.info(f"Validating cluster health before restarting pod {input_data.pod_name}")
             
-            # Retry health check with exponential backoff (state-based attempts)
-            # Default max attempts - will be overridden based on health state
-            max_attempts = 30
-            base_delay = 2.0  # Start with 2 seconds
-            max_delay = 30.0  # Cap at 30 seconds to keep total time reasonable
+            # Simplified health check - just check once
+            health_result = await self.check_cluster_health(
+                HealthCheckInput(
+                    cluster=input_data.cluster,
+                    dry_run=input_data.dry_run,
+                    timeout=30,
+                )
+            )
             
-            # Track attempts per health state
-            attempt = 0
-            while attempt < max_attempts:
-                try:
-                    health_result = await self.check_cluster_health(
-                        HealthCheckInput(
-                            cluster=input_data.cluster,
-                            dry_run=input_data.dry_run,
-                            timeout=30,
-                        )
-                    )
-                    
-                    if health_result.is_healthy and health_result.health_status == "GREEN":
-                        activity.logger.info(f"Cluster health is GREEN, proceeding with pod restart for {input_data.pod_name}")
-                        break  # Health is good, proceed with restart
-                    else:
-                        # Determine max attempts based on health state
-                        if health_result.health_status == "YELLOW":
-                            state_max_attempts = 30
-                        elif health_result.health_status == "RED":
-                            state_max_attempts = 30
-                        elif health_result.health_status == "UNKNOWN":
-                            state_max_attempts = 20
-                        else:
-                            # Other states - use minimal retries
-                            state_max_attempts = 5
-                        
-                        if attempt < state_max_attempts - 1:  # Not the last attempt for this state
-                            # Calculate exponential backoff with jitter
-                            delay = min(base_delay * (2 ** attempt), max_delay)
-                            jitter = random.uniform(0.1, 0.3) * delay  # 10-30% jitter
-                            total_delay = delay + jitter
-                            
-                            activity.logger.info(
-                                f"Cluster health is {health_result.health_status} (attempt {attempt + 1}/{state_max_attempts}). "
-                                f"Retrying in {total_delay:.1f} seconds..."
-                            )
-                            await asyncio.sleep(total_delay)
-                            attempt += 1
-                            continue
-                        else:
-                            # Last attempt failed for this health state
-                            error_msg = f"Cannot restart pod {input_data.pod_name}: cluster health is {health_result.health_status} after {state_max_attempts} attempts, must be GREEN"
-                            activity.logger.error(error_msg)
-                            raise Exception(error_msg)
-                            
-                except Exception as e:
-                    if "cluster health is" in str(e) and "must be GREEN" in str(e):
-                        # This is our health validation error, re-raise immediately
-                        raise e
-                    
-                    # This is a health check API error - use max attempts for API errors
-                    api_max_attempts = 20
-                    if attempt < api_max_attempts - 1:  # Not the last attempt
-                        # Calculate exponential backoff with jitter
-                        delay = min(base_delay * (2 ** attempt), max_delay)
-                        jitter = random.uniform(0.1, 0.3) * delay  # 10-30% jitter
-                        total_delay = delay + jitter
-                        
-                        activity.logger.warning(
-                            f"Health check failed (attempt {attempt + 1}/{api_max_attempts}): {e}. "
-                            f"Retrying in {total_delay:.1f} seconds..."
-                        )
-                        await asyncio.sleep(total_delay)
-                        attempt += 1
-                        continue
-                    else:
-                        # Last attempt failed
-                        error_msg = f"Health check failed before restarting pod {input_data.pod_name} after {api_max_attempts} attempts: {e}"
-                        activity.logger.error(error_msg)
-                        raise Exception(error_msg)
+            if not health_result.is_healthy or health_result.health_status != "GREEN":
+                error_msg = f"Cannot restart pod {input_data.pod_name}: cluster health is {health_result.health_status}, must be GREEN"
+                activity.logger.error(error_msg)
+                raise Exception(error_msg)
 
             # Execute decommission strategy - let Temporal handle failures and retries
             await self._execute_decommission_strategy(
@@ -952,3 +921,78 @@ class CrateDBActivities:
                 current_time=current_time,
                 in_maintenance_window=False
             )
+
+    @activity.defn
+    async def delete_pod(self, input_data: PodRestartInput) -> bool:
+        """
+        Delete a pod with proper grace period.
+        
+        Args:
+            input_data: Pod restart parameters
+            
+        Returns:
+            True if successful
+        """
+        try:
+            self._ensure_kube_client()
+            
+            if input_data.dry_run:
+                activity.logger.info(f"[DRY RUN] Would delete pod {input_data.pod_name}")
+                return True
+            
+            # Calculate grace period based on cluster configuration
+            grace_period = 30
+            if input_data.cluster.has_dc_util:
+                # Longer grace period for preStop hook to complete decommission
+                grace_period = input_data.cluster.dc_util_timeout + 60
+                activity.logger.info(f"Deleting pod {input_data.pod_name} - preStop hook will handle decommission")
+            else:
+                activity.logger.info(f"Manual decommission completed, now deleting pod {input_data.pod_name}")
+            
+            await asyncio.to_thread(
+                self.core_v1.delete_namespaced_pod,
+                name=input_data.pod_name,
+                namespace=input_data.namespace,
+                grace_period_seconds=grace_period
+            )
+            
+            activity.logger.info(f"Successfully deleted pod {input_data.pod_name}")
+            return True
+            
+        except Exception as e:
+            error_msg = f"Failed to delete pod {input_data.pod_name}: {e}"
+            activity.logger.error(error_msg)
+            raise Exception(error_msg)
+
+    @activity.defn
+    async def wait_for_pod_ready(self, input_data: PodRestartInput) -> bool:
+        """
+        Wait for a pod to be ready after restart.
+        
+        Args:
+            input_data: Pod restart parameters
+            
+        Returns:
+            True if pod becomes ready
+        """
+        try:
+            self._ensure_kube_client()
+            
+            if input_data.dry_run:
+                activity.logger.info(f"[DRY RUN] Would wait for pod {input_data.pod_name} to be ready")
+                await asyncio.sleep(5)  # Simulate wait time
+                return True
+            
+            await self._wait_for_pod_ready(
+                input_data.pod_name,
+                input_data.namespace,
+                input_data.pod_ready_timeout
+            )
+            
+            activity.logger.info(f"Pod {input_data.pod_name} is ready")
+            return True
+            
+        except Exception as e:
+            error_msg = f"Failed waiting for pod {input_data.pod_name} to be ready: {e}"
+            activity.logger.error(error_msg)
+            raise Exception(error_msg)
