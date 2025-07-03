@@ -4,7 +4,6 @@ Temporal activities for CrateDB Kubernetes operations.
 
 import asyncio
 import json
-import random
 import time
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
@@ -19,6 +18,8 @@ from .maintenance_windows import MaintenanceWindowChecker
 from .models import (
     ClusterDiscoveryInput,
     ClusterDiscoveryResult,
+    ClusterRoutingResetInput,
+    ClusterRoutingResetResult,
     ClusterValidationInput,
     ClusterValidationResult,
     CrateDBCluster,
@@ -491,6 +492,9 @@ class CrateDBActivities:
                 input_data.pod_ready_timeout
             )
 
+            # Note: Cluster routing allocation reset is now handled as a separate activity
+            # in the workflow to ensure Temporal execution guarantees
+
             duration = time.time() - start_time
             activity.logger.info(f"Successfully restarted pod {input_data.pod_name} in {duration:.2f}s")
 
@@ -507,6 +511,9 @@ class CrateDBActivities:
             duration = time.time() - start_time
             error_msg = f"Failed to restart pod {input_data.pod_name}: {e}"
             activity.logger.error(error_msg)
+
+            # Note: Cluster routing allocation reset is now handled as a separate activity
+            # in the workflow to ensure it executes even if pod restart fails
 
             return PodRestartResult(
                 pod_name=input_data.pod_name,
@@ -667,6 +674,163 @@ class CrateDBActivities:
                 activity.logger.debug(f"Manual decommission command {idx} completed")
 
         activity.logger.info(f"Manual decommission strategy completed for pod {pod_name}")
+
+    @activity.defn
+    async def reset_cluster_routing_allocation(self, input_data: ClusterRoutingResetInput) -> ClusterRoutingResetResult:
+        """
+        Reset cluster routing allocation setting to 'all' after manual decommission.
+        
+        This is a separate activity to ensure Temporal execution guarantees.
+        It will be retried by Temporal until successful or max attempts reached.
+        
+        Args:
+            input_data: Reset operation parameters
+            
+        Returns:
+            ClusterRoutingResetResult with operation status
+            
+        Raises:
+            Exception: If reset fails - allows Temporal to retry the activity
+        """
+        start_time = time.time()
+        started_at = datetime.now(timezone.utc)
+        
+        activity.logger.info(f"🔄 Starting cluster routing allocation reset for pod {input_data.pod_name}")
+        activity.logger.info(f"Target: {input_data.cluster.name} in {input_data.namespace}")
+        
+        # Wait for CrateDB to be fully ready
+        activity.logger.info(f"⏳ Waiting for CrateDB to accept SQL connections...")
+        await asyncio.sleep(10)  # Initial startup delay
+        
+        try:
+            # Attempt the reset with fallback logic
+            await self._reset_cluster_routing_allocation(
+                input_data.pod_name,
+                input_data.namespace,
+                input_data.cluster
+            )
+            
+            duration = time.time() - start_time
+            activity.logger.info(f"✅ Cluster routing allocation reset completed successfully in {duration:.2f}s")
+            
+            return ClusterRoutingResetResult(
+                pod_name=input_data.pod_name,
+                namespace=input_data.namespace,
+                cluster_name=input_data.cluster.name,
+                success=True,
+                duration=duration,
+                started_at=started_at,
+                completed_at=datetime.now(timezone.utc),
+                error=None
+            )
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            error_msg = f"Failed to reset cluster routing allocation for pod {input_data.pod_name}: {e}"
+            activity.logger.error(f"❌ {error_msg}")
+            
+            # Log critical instructions for manual intervention
+            activity.logger.error(f"🚨 CRITICAL: Cluster {input_data.cluster.name} may remain in degraded state")
+            activity.logger.error(f"📋 MANUAL INTERVENTION REQUIRED:")
+            activity.logger.error(f"   kubectl exec -n {input_data.namespace} {input_data.pod_name} -c crate -- \\")
+            activity.logger.error(f"     curl --insecure -sS -H 'Content-Type: application/json' \\")
+            activity.logger.error(f"     -X POST https://127.0.0.1:4200/_sql \\")
+            activity.logger.error(f"     -d '{{\"stmt\": \"set global transient \\\"cluster.routing.allocation.enable\\\" = \\\"all\\\"\"}}'")
+            
+            # Re-raise the exception to let Temporal retry the activity
+            raise Exception(error_msg) from e
+
+    async def _reset_cluster_routing_allocation_with_retry(self, pod_name: str, namespace: str, cluster: CrateDBCluster) -> None:
+        """
+        Reset cluster routing allocation setting to 'all' with retry logic and CrateDB connectivity checks.
+        
+        This method waits for CrateDB to be ready and retries the reset operation.
+        """
+        activity.logger.info(f"Attempting to reset cluster routing allocation to 'all' (target pod: {pod_name})")
+        
+        # Wait a bit for CrateDB to fully start accepting connections
+        activity.logger.info(f"Waiting for CrateDB to be ready to accept SQL commands...")
+        await asyncio.sleep(10)  # Give CrateDB time to start up
+        
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self._reset_cluster_routing_allocation(pod_name, namespace, cluster)
+                activity.logger.info(f"Successfully reset cluster routing allocation on attempt {attempt}")
+                return
+            except Exception as e:
+                if attempt < max_attempts:
+                    wait_time = attempt * 15  # 15, 30, 45, 60 seconds
+                    activity.logger.warning(f"Reset attempt {attempt}/{max_attempts} failed: {e}")
+                    activity.logger.info(f"Retrying in {wait_time}s... (CrateDB may still be starting)")
+                    await asyncio.sleep(wait_time)
+                else:
+                    activity.logger.error(f"Failed to reset cluster routing allocation after {max_attempts} attempts: {e}")
+                    activity.logger.error(f"CRITICAL: Cluster may remain in degraded state with allocation restricted to 'new_primaries'")
+                    activity.logger.error(f"MANUAL INTERVENTION REQUIRED: Execute on any CrateDB pod:")
+                    activity.logger.error(f"  set global transient \"cluster.routing.allocation.enable\" = \"all\"")
+                    break
+
+    async def _reset_cluster_routing_allocation(self, pod_name: str, namespace: str, cluster: CrateDBCluster) -> None:
+        """
+        Reset cluster routing allocation setting to 'all' after pod restart.
+        
+        This is necessary because manual decommission sets it to 'new_primaries'
+        and it needs to be reset once the pod is restarted and ready.
+        
+        If the target pod is unavailable, tries other pods in the namespace.
+        """
+        activity.logger.info(f"🔧 Executing cluster routing allocation reset command (target pod: {pod_name})")
+        
+        sql_cmd = 'set global transient "cluster.routing.allocation.enable" = "all"'
+        json_payload = json.dumps({"stmt": sql_cmd})
+        curl_cmd = f'curl --insecure -sS -H "Content-Type: application/json" -X POST https://127.0.0.1:4200/_sql -d \'{json_payload}\''
+        
+        # Try the target pod first
+        try:
+            resp = await self._execute_command_in_pod(pod_name, namespace, curl_cmd)
+            activity.logger.info(f"✅ Successfully reset cluster.routing.allocation.enable = 'all' via pod {pod_name}")
+            activity.logger.debug(f"Reset response: {resp}")
+            return
+        except Exception as e:
+            activity.logger.warning(f"⚠️  Failed to reset via target pod {pod_name}: {e}")
+            activity.logger.info(f"🔄 Attempting reset via other available pods in namespace {namespace}")
+        
+        # If target pod failed, try other pods from the cluster
+        try:
+            # Use cluster.pods list as primary source, fall back to discovery if needed
+            available_pods = [pod for pod in cluster.pods if pod != pod_name]
+            
+            if not available_pods:
+                # Fallback: discover pods in namespace
+                pods_response = await asyncio.to_thread(
+                    self.core_v1.list_namespaced_pod,
+                    namespace=namespace,
+                    label_selector="app=crate"
+                )
+                
+                for pod in pods_response.items:
+                    if (pod.status.phase == "Running" and 
+                        pod.metadata.name != pod_name and
+                        pod.status.conditions):
+                        ready = any(condition.type == "Ready" and condition.status == "True" 
+                                 for condition in pod.status.conditions)
+                        if ready:
+                            available_pods.append(pod.metadata.name)
+            
+            if not available_pods:
+                raise Exception("No available CrateDB pods found for reset operation")
+            
+            # Try the first available pod
+            fallback_pod = available_pods[0]
+            activity.logger.info(f"🔄 Attempting reset via fallback pod: {fallback_pod}")
+            resp = await self._execute_command_in_pod(fallback_pod, namespace, curl_cmd)
+            activity.logger.info(f"✅ Successfully reset cluster.routing.allocation.enable = 'all' via fallback pod {fallback_pod}")
+            activity.logger.debug(f"Reset response: {resp}")
+            
+        except Exception as e:
+            # Re-raise the exception so the retry logic can handle it
+            raise Exception(f"All reset attempts failed: {e}")
 
     async def _execute_command_in_pod(self, pod_name: str, namespace: str, command: str) -> str:
         """Execute a command in a pod using kubectl exec. Temporal handles timeouts and retries."""

@@ -5,8 +5,6 @@ This module implements state machine patterns using Temporal's workflow capabili
 to replace custom retry logic and state management with declarative workflows.
 """
 
-import asyncio
-import random
 from datetime import timedelta
 
 from temporalio import workflow
@@ -26,6 +24,8 @@ with workflow.unsafe.imports_passed_through():
         DecommissionInput,
         DecommissionResult,
         ClusterValidationInput,
+        ClusterRoutingResetInput,
+        ClusterRoutingResetResult,
     )
 
 
@@ -112,10 +112,12 @@ class HealthCheckStateMachine:
                     workflow.logger.error(error_msg)
                     raise HealthNotGreenException(current_state, error_msg)
 
-                # Wait before next attempt with exponential backoff and jitter
+                # Wait before next attempt with exponential backoff and deterministic jitter
                 base_wait = config["wait_seconds"]
                 exponential_wait = min(base_wait * (2 ** min(attempts, 10)), 60)  # Cap at 60 seconds
-                jitter = random.uniform(0.1, 0.3) * exponential_wait
+                # Use deterministic jitter based on attempt number to avoid random in workflows
+                jitter_factor = 0.1 + ((attempts % 10) * 0.02)  # Range from 0.1 to 0.28
+                jitter = jitter_factor * exponential_wait
                 total_wait = exponential_wait + jitter
 
                 workflow.logger.info(
@@ -259,7 +261,7 @@ class PodRestartStateMachine:
     State machine for pod restart operations.
 
     This breaks down the complex pod restart process into clear states:
-    HEALTH_CHECK -> DECOMMISSION -> DELETE -> WAIT_READY -> COMPLETE
+    HEALTH_CHECK -> DECOMMISSION -> DELETE -> WAIT_READY -> RESET_ROUTING -> COMPLETE
     """
 
     @workflow.run
@@ -267,7 +269,7 @@ class PodRestartStateMachine:
         """
         Execute pod restart with clear state transitions.
 
-        States: HEALTH_CHECK -> DECOMMISSION -> DELETE -> WAIT_READY -> COMPLETE
+        States: HEALTH_CHECK -> DECOMMISSION -> DELETE -> WAIT_READY -> RESET_ROUTING -> COMPLETE
         """
         start_time = workflow.now()
         
@@ -363,7 +365,41 @@ class PodRestartStateMachine:
 
             workflow.logger.info(f"[STATE: WAIT_READY] Pod {input_data.pod_name} is ready")
 
-            # STATE 5: COMPLETE
+            # STATE 5: RESET_ROUTING - Reset cluster routing allocation (for manual decommission only)
+            if not input_data.cluster.has_dc_util:
+                workflow.logger.info(f"[STATE: RESET_ROUTING] Resetting cluster routing allocation for {input_data.pod_name}")
+                
+                reset_input = ClusterRoutingResetInput(
+                    pod_name=input_data.pod_name,
+                    namespace=input_data.namespace,
+                    cluster=input_data.cluster,
+                    dry_run=input_data.dry_run,
+                )
+                
+                try:
+                    reset_result = await workflow.execute_activity(
+                        "reset_cluster_routing_allocation",
+                        reset_input,
+                        start_to_close_timeout=timedelta(minutes=5),
+                        retry_policy=RetryPolicy(
+                            initial_interval=timedelta(seconds=15),
+                            maximum_interval=timedelta(seconds=60),
+                            maximum_attempts=5,
+                            backoff_coefficient=2.0,
+                        ),
+                    )
+                    
+                    workflow.logger.info(f"[STATE: RESET_ROUTING] Successfully reset cluster routing allocation for {input_data.pod_name}")
+                    
+                except Exception as e:
+                    workflow.logger.error(f"[STATE: RESET_ROUTING] Failed to reset cluster routing allocation: {e}")
+                    # Don't fail the entire restart, but log the issue
+                    workflow.logger.error(f"[STATE: RESET_ROUTING] Manual intervention may be required for cluster {input_data.cluster.name}")
+                    workflow.logger.error(f"[STATE: RESET_ROUTING] Execute manually: kubectl exec -n {input_data.namespace} {input_data.pod_name} -c crate -- curl --insecure -sS -H 'Content-Type: application/json' -X POST https://127.0.0.1:4200/_sql -d '{{\"stmt\": \"set global transient \\\"cluster.routing.allocation.enable\\\" = \\\"all\\\"\"}}'")
+            else:
+                workflow.logger.info(f"[STATE: RESET_ROUTING] Skipping routing reset (Kubernetes-managed decommission)")
+
+            # STATE 6: COMPLETE
             end_time = workflow.now()
             duration = (end_time - start_time).total_seconds()
 

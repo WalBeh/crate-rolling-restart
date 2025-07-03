@@ -100,6 +100,28 @@ class HealthCheckInput(BaseModel):
     timeout: int = 300
 
 
+class ClusterRoutingResetInput(BaseModel):
+    """Input for cluster routing allocation reset activity."""
+    
+    pod_name: str
+    namespace: str
+    cluster: CrateDBCluster
+    dry_run: bool = False
+
+
+class ClusterRoutingResetResult(BaseModel):
+    """Result of cluster routing allocation reset activity."""
+    
+    pod_name: str
+    namespace: str
+    cluster_name: str
+    success: bool
+    duration: float
+    error: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
 class HealthCheckResult(BaseModel):
     """Result of health check activity."""
     
