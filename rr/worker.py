@@ -81,6 +81,7 @@ class WorkerManager:
                 activities.delete_pod,
                 activities.wait_for_pod_ready,
                 activities.reset_cluster_routing_allocation,
+                activities.is_pod_on_suspended_node,
             ],
             # Configure worker options for development
             max_concurrent_activities=5,

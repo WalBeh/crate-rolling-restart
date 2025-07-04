@@ -38,6 +38,7 @@ class RestartOptions(BaseModel):
     health_check_timeout: int = 300
     maintenance_config_path: Optional[str] = None
     ignore_maintenance_windows: bool = False
+    only_on_suspended_nodes: bool = False
 
 
 class RestartResult(BaseModel):

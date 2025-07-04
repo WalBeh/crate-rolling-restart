@@ -1160,3 +1160,86 @@ class CrateDBActivities:
             error_msg = f"Failed waiting for pod {input_data.pod_name} to be ready: {e}"
             activity.logger.error(error_msg)
             raise Exception(error_msg)
+
+    @activity.defn
+    async def is_pod_on_suspended_node(self, pod_name: str, namespace: str) -> bool:
+        """
+        Check if a pod is running on a suspended Kubernetes node.
+        
+        Args:
+            pod_name: Name of the pod to check
+            namespace: Namespace of the pod
+            
+        Returns:
+            True if pod is running on a suspended node, False otherwise
+        """
+        try:
+            self._ensure_kube_client()
+            
+            # Get pod details to find which node it's running on
+            pod = await asyncio.to_thread(
+                self.core_v1.read_namespaced_pod,
+                name=pod_name,
+                namespace=namespace
+            )
+            
+            if not pod.spec.node_name:
+                activity.logger.warning(f"Pod {pod_name} has no assigned node")
+                return False
+            
+            node_name = pod.spec.node_name
+            activity.logger.info(f"Pod {pod_name} is running on node {node_name}")
+            
+            # Get node details to check if it's suspended
+            node = await asyncio.to_thread(
+                self.core_v1.read_node,
+                name=node_name
+            )
+            
+            # Check if node is suspended (has unschedulable taint or annotation)
+            is_suspended = False
+            
+            # Check if node is marked as unschedulable
+            if node.spec.unschedulable:
+                is_suspended = True
+                activity.logger.info(f"Node {node_name} is marked as unschedulable")
+            
+            # Check for common suspension taints
+            if node.spec.taints:
+                for taint in node.spec.taints:
+                    if taint.key in [
+                        "node.kubernetes.io/unschedulable",
+                        "node.kubernetes.io/not-ready",
+                        "node.kubernetes.io/unreachable",
+                        "aws.amazon.com/spot-instance-terminating",
+                        "cluster-autoscaler.kubernetes.io/scale-down-disabled",
+                        "node.kubernetes.io/suspend"
+                    ]:
+                        is_suspended = True
+                        activity.logger.info(f"Node {node_name} has suspension taint: {taint.key}={taint.value}")
+                        break
+            
+            # Check for suspension annotations
+            if node.metadata.annotations:
+                for annotation_key in [
+                    "cluster-autoscaler.kubernetes.io/scale-down-disabled",
+                    "node.kubernetes.io/suspend",
+                    "node.kubernetes.io/suspended"
+                ]:
+                    if annotation_key in node.metadata.annotations:
+                        is_suspended = True
+                        activity.logger.info(f"Node {node_name} has suspension annotation: {annotation_key}")
+                        break
+            
+            if is_suspended:
+                activity.logger.info(f"Pod {pod_name} is running on suspended node {node_name}")
+            else:
+                activity.logger.info(f"Pod {pod_name} is running on active node {node_name}")
+                
+            return is_suspended
+            
+        except Exception as e:
+            error_msg = f"Failed to check if pod {pod_name} is on suspended node: {e}"
+            activity.logger.error(error_msg)
+            # Default to False to avoid blocking operations on error
+            return False
