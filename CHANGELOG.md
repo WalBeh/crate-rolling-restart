@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Maintenance window management with signal-based overrides
 - Dictionary access fixes for Temporal activity results
 - Comprehensive legacy code cleanup
+- **Enhanced Cluster Routing Allocation Reset**: Automatic reset of `cluster.routing.allocation.enable` setting to "all" after pod restarts when using manual decommission
+  - Reset executes independently of cluster health state (GREEN/YELLOW/RED) 
+  - Reset occurs even if pod restart operations fail
+  - Improved timing: waits for CrateDB startup and pod readiness before attempting reset
+  - Retry mechanism: up to 5 attempts with exponential backoff (15s, 30s, 45s, 60s intervals)
+  - Fallback mechanism tries alternative pods if target pod is unavailable
+  - Critical error logging with manual intervention instructions when all attempts fail
 
 ### Changed
 - Fixed AttributeError issues with activity results being accessed as objects instead of dictionaries
@@ -44,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed 'dict' object has no attribute 'is_valid' error in cluster validation
 - Fixed 'dict' object has no attribute 'health_status' error in health checks
 - Fixed 'PodRestartResult' object is not subscriptable error in pod restart workflows
+- Fixed cluster routing allocation setting not being reset after manual decommission and pod restart
+- Enhanced cluster routing reset to work independently of cluster health and operation success/failure
+- Improved cluster routing reset timing to wait for CrateDB readiness before attempting reset
+- Added retry mechanism with exponential backoff for cluster routing reset operations
+- Added fallback mechanism for routing reset when target pod is unavailable
+- Fixed random.uniform usage in HealthCheckStateMachine workflow (replaced with deterministic jitter)
 
 ## [0.1.1] - 2025-01-30
 
