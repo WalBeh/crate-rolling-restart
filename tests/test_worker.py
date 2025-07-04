@@ -34,8 +34,8 @@ class HelloWorkflow:
         """Run a simple deterministic workflow."""
         workflow.logger.info(f"Starting hello workflow for: {name}")
         
-        # Use workflow.utc_now() for deterministic time
-        start_time = workflow.utc_now()
+        # Use workflow.now() for deterministic time
+        start_time = workflow.now()
         
         # Execute activity with proper retry policy
         result = await workflow.execute_activity(
@@ -56,7 +56,7 @@ class HelloWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
         )
         
-        end_time = workflow.utc_now()
+        end_time = workflow.now()
         duration = (end_time - start_time).total_seconds()
         
         workflow.logger.info(f"Workflow completed in {duration:.2f}s")

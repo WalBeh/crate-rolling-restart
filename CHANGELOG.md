@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Reset executes independently of cluster health state (GREEN/YELLOW/RED) 
   - Reset occurs even if pod restart operations fail
   - Improved timing: waits for CrateDB startup and pod readiness before attempting reset
-  - Retry mechanism: up to 5 attempts with exponential backoff (15s, 30s, 45s, 60s intervals)
+  - Retry mechanism: up to 2 attempts with exponential backoff (5s interval)
   - Fallback mechanism tries alternative pods if target pod is unavailable
   - Critical error logging with manual intervention instructions when all attempts fail
 

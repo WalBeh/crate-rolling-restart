@@ -177,7 +177,7 @@ class TestClusterRoutingAllocationReset:
         )
         mock_cratedb_activities._execute_decommission_strategy = AsyncMock()
         mock_cratedb_activities._wait_for_pod_ready = AsyncMock()
-        mock_cratedb_activities._reset_cluster_routing_allocation_with_retry = AsyncMock()
+        # Note: reset is now handled by state machine, not directly in restart_pod
         
         # Mock pod deletion
         with patch('asyncio.to_thread') as mock_to_thread:
@@ -193,8 +193,8 @@ class TestClusterRoutingAllocationReset:
             # Execute restart_pod
             result = await mock_cratedb_activities.restart_pod(input_data)
             
-            # Verify that reset is NOT called directly from restart_pod anymore
-            mock_cratedb_activities._reset_cluster_routing_allocation_with_retry.assert_not_called()
+            # Verify that restart succeeded (reset is now handled by state machine)
+            # No direct reset method calls should be made from restart_pod
             
             # Verify that restart succeeded (reset is now handled by state machine)
             assert result.success is True
@@ -318,59 +318,53 @@ class TestClusterRoutingAllocationReset:
 
     @pytest.mark.asyncio
     async def test_reset_with_retry_mechanism_success(self, mock_cratedb_activities, manual_decommission_cluster):
-        """Test that the internal retry mechanism works when reset eventually succeeds."""
-        attempt_count = 0
+        """Test that the activity works with Temporal retry configuration."""
+        # Mock the underlying reset method to succeed
+        mock_cratedb_activities._reset_cluster_routing_allocation = AsyncMock()
         
-        async def mock_reset(*args, **kwargs):
-            nonlocal attempt_count
-            attempt_count += 1
-            if attempt_count < 3:
-                raise Exception("CrateDB not ready yet")
-            # Success on 3rd attempt
-            return
-        
-        mock_cratedb_activities._reset_cluster_routing_allocation = mock_reset
+        # Create input for the activity
+        reset_input = ClusterRoutingResetInput(
+            pod_name="test-pod-0",
+            namespace="test-namespace",
+            cluster=manual_decommission_cluster,
+            dry_run=False
+        )
         
         # Mock sleep to speed up test
-        with patch('asyncio.sleep') as mock_sleep:
-            # Execute the retry method directly (this tests the internal retry wrapper)
-            await mock_cratedb_activities._reset_cluster_routing_allocation_with_retry(
-                "test-pod-0",
-                "test-namespace", 
-                manual_decommission_cluster
-            )
+        with patch('asyncio.sleep'):
+            # Execute the reset activity (Temporal handles retries)
+            result = await mock_cratedb_activities.reset_cluster_routing_allocation(reset_input)
         
-        # Verify retry logic was used
-        assert attempt_count == 3  # Failed twice, succeeded on third attempt
-        assert mock_sleep.call_count >= 2  # Called for initial wait + retries
+        # Verify the activity succeeded
+        assert result.success is True
+        assert result.pod_name == "test-pod-0"
+        mock_cratedb_activities._reset_cluster_routing_allocation.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_reset_with_retry_mechanism_max_attempts(self, mock_cratedb_activities, manual_decommission_cluster):
-        """Test that internal retry mechanism stops after max attempts."""
-        attempt_count = 0
+        """Test that activity fails after max attempts (handled by Temporal)."""
+        # Mock the underlying reset method to always fail
+        mock_cratedb_activities._reset_cluster_routing_allocation = AsyncMock(
+            side_effect=Exception("CrateDB connection failed")
+        )
         
-        async def mock_reset(*args, **kwargs):
-            nonlocal attempt_count
-            attempt_count += 1
-            raise Exception("CrateDB connection failed")
+        # Create input for the activity
+        reset_input = ClusterRoutingResetInput(
+            pod_name="test-pod-0",
+            namespace="test-namespace",
+            cluster=manual_decommission_cluster,
+            dry_run=False
+        )
         
-        mock_cratedb_activities._reset_cluster_routing_allocation = mock_reset
-        
-        # Mock sleep to speed up test  
+        # Mock sleep to speed up test
         with patch('asyncio.sleep'):
-            # Execute the retry method directly - should not raise exception
-            await mock_cratedb_activities._reset_cluster_routing_allocation_with_retry(
-                "test-pod-0",
-                "test-namespace",
-                manual_decommission_cluster
-            )
-        
-        # Verify all attempts were made
-        assert attempt_count == 5  # Max attempts reached
+            # Execute the reset activity - should raise exception for Temporal to handle
+            with pytest.raises(Exception, match="Failed to reset cluster routing allocation"):
+                await mock_cratedb_activities.reset_cluster_routing_allocation(reset_input)
 
     @pytest.mark.asyncio
     async def test_reset_timing_with_crate_startup_delay(self, mock_cratedb_activities, manual_decommission_cluster):
-        """Test that reset waits for CrateDB startup before attempting reset."""
+        """Test that reset activity includes startup delay before attempting reset."""
         sleep_calls = []
         
         async def mock_sleep(duration):
@@ -378,34 +372,39 @@ class TestClusterRoutingAllocationReset:
         
         mock_cratedb_activities._reset_cluster_routing_allocation = AsyncMock()
         
-        with patch('asyncio.sleep', side_effect=mock_sleep):
-            await mock_cratedb_activities._reset_cluster_routing_allocation_with_retry(
-                "test-pod-0",
-                "test-namespace",
-                manual_decommission_cluster
-            )
+        # Create input for the activity
+        reset_input = ClusterRoutingResetInput(
+            pod_name="test-pod-0",
+            namespace="test-namespace",
+            cluster=manual_decommission_cluster,
+            dry_run=False
+        )
         
-        # Verify initial wait for CrateDB startup
-        assert 10 in sleep_calls  # Initial 10-second wait for CrateDB startup
+        with patch('asyncio.sleep', side_effect=mock_sleep):
+            await mock_cratedb_activities.reset_cluster_routing_allocation(reset_input)
+        
+        # Verify startup delay is included in activity
+        assert 3 in sleep_calls  # Activity includes 3-second startup delay
         mock_cratedb_activities._reset_cluster_routing_allocation.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_reset_with_retry_wrapper_never_raises_exception(self, mock_cratedb_activities, manual_decommission_cluster):
-        """Test that the retry wrapper never raises exceptions, even on complete failure."""
+    async def test_reset_activity_properly_raises_exceptions_for_temporal(self, mock_cratedb_activities, manual_decommission_cluster):
+        """Test that the activity properly raises exceptions for Temporal to handle."""
         # Mock the underlying reset to always fail
         mock_cratedb_activities._reset_cluster_routing_allocation = AsyncMock(
             side_effect=Exception("Connection failed")
         )
         
+        # Create input for the activity
+        reset_input = ClusterRoutingResetInput(
+            pod_name="test-pod-0",
+            namespace="test-namespace",
+            cluster=manual_decommission_cluster,
+            dry_run=False
+        )
+        
         # Mock sleep to speed up test
         with patch('asyncio.sleep'):
-            # Execute the retry wrapper - should never raise exception
-            try:
-                await mock_cratedb_activities._reset_cluster_routing_allocation_with_retry(
-                    "test-pod-0",
-                    "test-namespace",
-                    manual_decommission_cluster
-                )
-                # Should complete without raising exception
-            except Exception:
-                pytest.fail("_reset_cluster_routing_allocation_with_retry should never raise exceptions")
+            # Execute the activity - should raise exception for Temporal to retry
+            with pytest.raises(Exception, match="Failed to reset cluster routing allocation"):
+                await mock_cratedb_activities.reset_cluster_routing_allocation(reset_input)

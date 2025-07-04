@@ -253,8 +253,7 @@ async def test_restart_workflow_with_cluster_object():
         
         result = await client.execute_workflow(
             ClusterRestartWorkflow.run,
-            cluster,
-            options,
+            args=[cluster, options],
             id="test-single-cluster-restart",
             task_queue="cratedb-operations",
             execution_timeout=timedelta(minutes=2),

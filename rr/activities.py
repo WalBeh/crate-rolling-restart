@@ -411,7 +411,7 @@ class CrateDBActivities:
     async def restart_pod(self, input_data: PodRestartInput) -> PodRestartResult:
         """
         Restart a single pod - LEGACY METHOD for backward compatibility.
-        
+
         This method is kept for backward compatibility but new code should use
         the state machine approach via PodRestartStateMachine.
 
@@ -445,7 +445,7 @@ class CrateDBActivities:
             # CRITICAL: Validate cluster health before proceeding with pod restart
             # This prevents pods from being deleted when cluster is not GREEN
             activity.logger.info(f"Validating cluster health before restarting pod {input_data.pod_name}")
-            
+
             # Simplified health check - just check once
             health_result = await self.check_cluster_health(
                 HealthCheckInput(
@@ -454,7 +454,7 @@ class CrateDBActivities:
                     timeout=30,
                 )
             )
-            
+
             if not health_result.is_healthy or health_result.health_status != "GREEN":
                 error_msg = f"Cannot restart pod {input_data.pod_name}: cluster health is {health_result.health_status}, must be GREEN"
                 activity.logger.error(error_msg)
@@ -537,6 +537,9 @@ class CrateDBActivities:
         start_time = datetime.now(timezone.utc)
         activity.logger.info(f"Starting decommission for pod {input_data.pod_name}")
 
+        # Send heartbeat with initial status
+        activity.heartbeat({"status": "starting", "pod": input_data.pod_name})
+
         if input_data.dry_run:
             activity.logger.info(f"[DRY RUN] Would decommission pod {input_data.pod_name}")
             return DecommissionResult(
@@ -550,12 +553,32 @@ class CrateDBActivities:
             )
 
         try:
+            # CRITICAL: Check cluster health before decommission
+            # Only GREEN status is safe for decommission operations
+            activity.logger.info(f"Checking cluster health before decommissioning pod {input_data.pod_name}")
+            activity.heartbeat({"status": "health_check", "pod": input_data.pod_name})
+            
+            health_input = HealthCheckInput(
+                cluster=input_data.cluster,
+                dry_run=False,
+                timeout=60
+            )
+            
+            health_result = await self.check_cluster_health(health_input)
+            activity.logger.info(f"Cluster health validated: {health_result.health_status}")
+            
+            # Send heartbeat before strategy analysis
+            activity.heartbeat({"status": "analyzing_strategy", "pod": input_data.pod_name})
+
             # Execute decommission strategy - let Temporal handle failures
             await self._execute_decommission_strategy(
                 input_data.pod_name,
                 input_data.namespace,
                 input_data.cluster
             )
+
+            # Send heartbeat on completion
+            activity.heartbeat({"status": "completed", "pod": input_data.pod_name})
 
             end_time = datetime.now(timezone.utc)
             duration = (end_time - start_time).total_seconds()
@@ -576,6 +599,9 @@ class CrateDBActivities:
             )
 
         except Exception as e:
+            # Send heartbeat on failure
+            activity.heartbeat({"status": "failed", "error": str(e), "pod": input_data.pod_name})
+
             end_time = datetime.now(timezone.utc)
             duration = (end_time - start_time).total_seconds()
             error_msg = f"Decommission failed for pod {input_data.pod_name}: {str(e)}"
@@ -596,6 +622,9 @@ class CrateDBActivities:
         """Execute the appropriate decommission strategy based on cluster configuration."""
         activity.logger.info(f"Analyzing decommission strategy for pod {pod_name}")
         activity.logger.info(f"Cluster config: has_prestop_hook={cluster.has_prestop_hook}, has_dc_util={cluster.has_dc_util}")
+
+        # Send heartbeat during strategy execution
+        activity.heartbeat({"status": "executing_strategy", "pod": pod_name})
 
         if cluster.has_dc_util:
             # For Kubernetes-managed decommission, just delete the pod
@@ -618,6 +647,9 @@ class CrateDBActivities:
         activity.logger.info(f"Using manual decommission for pod {pod_name}")
         activity.logger.info(f"No dc_util configured - executing manual decommission via CrateDB API")
 
+        # Send heartbeat for manual decommission start
+        activity.heartbeat({"status": "manual_decommission_start", "pod": pod_name})
+
         # Execute manual decommission commands
         pod_suffix = pod_name.rsplit("-", 1)[-1]
 
@@ -638,6 +670,9 @@ class CrateDBActivities:
         # Execute each command
         for idx, sql_cmd in enumerate(sql_commands, 1):
             activity.logger.debug(f"Executing manual decommission SQL {idx}/5: {sql_cmd}")
+
+            # Send heartbeat for each command
+            activity.heartbeat({"status": f"executing_sql_command_{idx}", "pod": pod_name, "command": sql_cmd[:50]})
 
             # Create curl command
             json_payload = json.dumps({"stmt": sql_cmd})
@@ -670,8 +705,12 @@ class CrateDBActivities:
                 activity.logger.info(f"Manual decommission completed - CrateDB process has exited")
                 activity.logger.info(f"Pod {pod_name} is ready for deletion and restart")
                 activity.logger.debug(f"Decommission response: {resp}")
+                # Send heartbeat for decommission completion
+                activity.heartbeat({"status": "manual_decommission_completed", "pod": pod_name})
             else:
                 activity.logger.debug(f"Manual decommission command {idx} completed")
+                # Send heartbeat for command completion
+                activity.heartbeat({"status": f"sql_command_{idx}_completed", "pod": pod_name})
 
         activity.logger.info(f"Manual decommission strategy completed for pod {pod_name}")
 
@@ -679,40 +718,90 @@ class CrateDBActivities:
     async def reset_cluster_routing_allocation(self, input_data: ClusterRoutingResetInput) -> ClusterRoutingResetResult:
         """
         Reset cluster routing allocation setting to 'all' after manual decommission.
-        
+
         This is a separate activity to ensure Temporal execution guarantees.
         It will be retried by Temporal until successful or max attempts reached.
-        
+
         Args:
             input_data: Reset operation parameters
-            
+
         Returns:
             ClusterRoutingResetResult with operation status
-            
+
         Raises:
             Exception: If reset fails - allows Temporal to retry the activity
         """
         start_time = time.time()
         started_at = datetime.now(timezone.utc)
-        
+
         activity.logger.info(f"🔄 Starting cluster routing allocation reset for pod {input_data.pod_name}")
         activity.logger.info(f"Target: {input_data.cluster.name} in {input_data.namespace}")
-        
-        # Wait for CrateDB to be fully ready
-        activity.logger.info(f"⏳ Waiting for CrateDB to accept SQL connections...")
-        await asyncio.sleep(10)  # Initial startup delay
-        
+
+        # Send initial heartbeat (safe for testing)
         try:
-            # Attempt the reset with fallback logic
-            await self._reset_cluster_routing_allocation(
-                input_data.pod_name,
-                input_data.namespace,
-                input_data.cluster
-            )
-            
+            activity.heartbeat({
+                "status": "starting_routing_reset",
+                "pod": input_data.pod_name,
+                "cluster": input_data.cluster.name
+            })
+        except RuntimeError:
+            # Not in activity context (e.g., during testing)
+            pass
+
+        # Brief wait for CrateDB to be ready (reduced from 10s to 5s)
+        activity.logger.info(f"⏳ Waiting for CrateDB to accept SQL connections...")
+
+        # Send heartbeat during startup wait (safe for testing)
+        try:
+            activity.heartbeat({
+                "status": "waiting_for_cratedb_startup",
+                "pod": input_data.pod_name
+            })
+        except RuntimeError:
+            # Not in activity context (e.g., during testing)
+            pass
+
+        await asyncio.sleep(3)  # Further reduced startup delay for 2 retry attempts
+
+        try:
+            # Send heartbeat before reset attempt (safe for testing)
+            try:
+                activity.heartbeat({
+                    "status": "executing_routing_reset",
+                    "pod": input_data.pod_name,
+                    "max_attempts": 5
+                })
+            except RuntimeError:
+                # Not in activity context (e.g., during testing)
+                pass
+
+            # Attempt the reset with timeout protection
+            try:
+                await asyncio.wait_for(
+                    self._reset_cluster_routing_allocation(
+                        input_data.pod_name,
+                        input_data.namespace,
+                        input_data.cluster
+                    ),
+                    timeout=40  # 40 second internal timeout for 2 retry attempts
+                )
+            except asyncio.TimeoutError:
+                raise Exception(f"Routing reset timed out after 40 seconds for pod {input_data.pod_name}")
+
             duration = time.time() - start_time
             activity.logger.info(f"✅ Cluster routing allocation reset completed successfully in {duration:.2f}s")
-            
+
+            # Send completion heartbeat (safe for testing)
+            try:
+                activity.heartbeat({
+                    "status": "routing_reset_completed",
+                    "pod": input_data.pod_name,
+                    "duration": duration
+                })
+            except RuntimeError:
+                # Not in activity context (e.g., during testing)
+                pass
+
             return ClusterRoutingResetResult(
                 pod_name=input_data.pod_name,
                 namespace=input_data.namespace,
@@ -723,12 +812,12 @@ class CrateDBActivities:
                 completed_at=datetime.now(timezone.utc),
                 error=None
             )
-            
+
         except Exception as e:
             duration = time.time() - start_time
             error_msg = f"Failed to reset cluster routing allocation for pod {input_data.pod_name}: {e}"
             activity.logger.error(f"❌ {error_msg}")
-            
+
             # Log critical instructions for manual intervention
             activity.logger.error(f"🚨 CRITICAL: Cluster {input_data.cluster.name} may remain in degraded state")
             activity.logger.error(f"📋 MANUAL INTERVENTION REQUIRED:")
@@ -736,101 +825,48 @@ class CrateDBActivities:
             activity.logger.error(f"     curl --insecure -sS -H 'Content-Type: application/json' \\")
             activity.logger.error(f"     -X POST https://127.0.0.1:4200/_sql \\")
             activity.logger.error(f"     -d '{{\"stmt\": \"set global transient \\\"cluster.routing.allocation.enable\\\" = \\\"all\\\"\"}}'")
-            
+
             # Re-raise the exception to let Temporal retry the activity
             raise Exception(error_msg) from e
 
-    async def _reset_cluster_routing_allocation_with_retry(self, pod_name: str, namespace: str, cluster: CrateDBCluster) -> None:
-        """
-        Reset cluster routing allocation setting to 'all' with retry logic and CrateDB connectivity checks.
-        
-        This method waits for CrateDB to be ready and retries the reset operation.
-        """
-        activity.logger.info(f"Attempting to reset cluster routing allocation to 'all' (target pod: {pod_name})")
-        
-        # Wait a bit for CrateDB to fully start accepting connections
-        activity.logger.info(f"Waiting for CrateDB to be ready to accept SQL commands...")
-        await asyncio.sleep(10)  # Give CrateDB time to start up
-        
-        max_attempts = 5
-        for attempt in range(1, max_attempts + 1):
-            try:
-                await self._reset_cluster_routing_allocation(pod_name, namespace, cluster)
-                activity.logger.info(f"Successfully reset cluster routing allocation on attempt {attempt}")
-                return
-            except Exception as e:
-                if attempt < max_attempts:
-                    wait_time = attempt * 15  # 15, 30, 45, 60 seconds
-                    activity.logger.warning(f"Reset attempt {attempt}/{max_attempts} failed: {e}")
-                    activity.logger.info(f"Retrying in {wait_time}s... (CrateDB may still be starting)")
-                    await asyncio.sleep(wait_time)
-                else:
-                    activity.logger.error(f"Failed to reset cluster routing allocation after {max_attempts} attempts: {e}")
-                    activity.logger.error(f"CRITICAL: Cluster may remain in degraded state with allocation restricted to 'new_primaries'")
-                    activity.logger.error(f"MANUAL INTERVENTION REQUIRED: Execute on any CrateDB pod:")
-                    activity.logger.error(f"  set global transient \"cluster.routing.allocation.enable\" = \"all\"")
-                    break
+
 
     async def _reset_cluster_routing_allocation(self, pod_name: str, namespace: str, cluster: CrateDBCluster) -> None:
         """
         Reset cluster routing allocation setting to 'all' after pod restart.
-        
-        This is necessary because manual decommission sets it to 'new_primaries'
-        and it needs to be reset once the pod is restarted and ready.
-        
-        If the target pod is unavailable, tries other pods in the namespace.
+
+        Simplified version with single attempt to reduce timeout issues.
         """
         activity.logger.info(f"🔧 Executing cluster routing allocation reset command (target pod: {pod_name})")
-        
+
         sql_cmd = 'set global transient "cluster.routing.allocation.enable" = "all"'
         json_payload = json.dumps({"stmt": sql_cmd})
         curl_cmd = f'curl --insecure -sS -H "Content-Type: application/json" -X POST https://127.0.0.1:4200/_sql -d \'{json_payload}\''
-        
-        # Try the target pod first
+
+        # Try target pod first
         try:
             resp = await self._execute_command_in_pod(pod_name, namespace, curl_cmd)
             activity.logger.info(f"✅ Successfully reset cluster.routing.allocation.enable = 'all' via pod {pod_name}")
             activity.logger.debug(f"Reset response: {resp}")
             return
         except Exception as e:
-            activity.logger.warning(f"⚠️  Failed to reset via target pod {pod_name}: {e}")
-            activity.logger.info(f"🔄 Attempting reset via other available pods in namespace {namespace}")
-        
-        # If target pod failed, try other pods from the cluster
-        try:
-            # Use cluster.pods list as primary source, fall back to discovery if needed
-            available_pods = [pod for pod in cluster.pods if pod != pod_name]
+            activity.logger.warning(f"Failed to reset via target pod {pod_name}: {e}")
             
-            if not available_pods:
-                # Fallback: discover pods in namespace
-                pods_response = await asyncio.to_thread(
-                    self.core_v1.list_namespaced_pod,
-                    namespace=namespace,
-                    label_selector="app=crate"
-                )
+        # Try fallback pods from cluster
+        fallback_pods = [p for p in cluster.pods if p != pod_name]
+        for fallback_pod in fallback_pods:
+            try:
+                resp = await self._execute_command_in_pod(fallback_pod, namespace, curl_cmd)
+                activity.logger.info(f"✅ Successfully reset cluster.routing.allocation.enable = 'all' via fallback pod {fallback_pod}")
+                activity.logger.debug(f"Reset response: {resp}")
+                return
+            except Exception as e:
+                activity.logger.warning(f"Failed to reset via fallback pod {fallback_pod}: {e}")
                 
-                for pod in pods_response.items:
-                    if (pod.status.phase == "Running" and 
-                        pod.metadata.name != pod_name and
-                        pod.status.conditions):
-                        ready = any(condition.type == "Ready" and condition.status == "True" 
-                                 for condition in pod.status.conditions)
-                        if ready:
-                            available_pods.append(pod.metadata.name)
-            
-            if not available_pods:
-                raise Exception("No available CrateDB pods found for reset operation")
-            
-            # Try the first available pod
-            fallback_pod = available_pods[0]
-            activity.logger.info(f"🔄 Attempting reset via fallback pod: {fallback_pod}")
-            resp = await self._execute_command_in_pod(fallback_pod, namespace, curl_cmd)
-            activity.logger.info(f"✅ Successfully reset cluster.routing.allocation.enable = 'all' via fallback pod {fallback_pod}")
-            activity.logger.debug(f"Reset response: {resp}")
-            
-        except Exception as e:
-            # Re-raise the exception so the retry logic can handle it
-            raise Exception(f"All reset attempts failed: {e}")
+        # If all pods failed, raise exception
+        raise Exception("All reset attempts failed")
+
+
 
     async def _execute_command_in_pod(self, pod_name: str, namespace: str, command: str) -> str:
         """Execute a command in a pod using kubectl exec. Temporal handles timeouts and retries."""
@@ -877,55 +913,177 @@ class CrateDBActivities:
         raise TimeoutError(f"Pod {pod_name} was not deleted within {timeout}s")
 
     async def _wait_for_pod_ready(self, pod_name: str, namespace: str, timeout: int) -> None:
-        """Wait for a pod to be ready."""
+        """Wait for a pod to be ready with improved error handling and heartbeat management."""
         start_time = time.time()
         pod_ready_time = None
         min_ready_duration = 20  # Minimum time pod should be ready
+        last_heartbeat = start_time
+        consecutive_errors = 0
+        max_consecutive_errors = 3
+
+        activity.logger.info(f"Waiting for pod {pod_name} to be ready (timeout: {timeout}s)")
+
+        # Send initial status heartbeat
+        activity.heartbeat({
+            "status": "waiting_for_pod_ready_start",
+            "pod": pod_name,
+            "timeout": timeout,
+            "min_ready_duration": min_ready_duration
+        })
 
         while time.time() - start_time < timeout:
+            current_time = time.time()
+            elapsed = current_time - start_time
+
+            # Send heartbeat every 20 seconds (well within 30 second timeout)
+            if current_time - last_heartbeat >= 20:
+                activity.heartbeat({
+                    "status": "waiting_for_pod_ready_progress",
+                    "pod": pod_name,
+                    "elapsed_seconds": elapsed,
+                    "timeout_seconds": timeout
+                })
+                last_heartbeat = current_time
+
             try:
-                pod = self.core_v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+                # Use asyncio.to_thread for the API call to avoid blocking
+                pod = await asyncio.to_thread(
+                    self.core_v1.read_namespaced_pod,
+                    name=pod_name,
+                    namespace=namespace
+                )
+
+                # Reset error counter on successful API call
+                consecutive_errors = 0
+
+                # Enhanced status reporting
+                pod_phase = pod.status.phase if pod.status else "Unknown"
+                activity.logger.debug(f"Pod {pod_name} status: phase={pod_phase}")
 
                 if pod.status.phase == "Running":
                     ready = True
+                    ready_conditions = []
+
                     for condition in pod.status.conditions or []:
-                        if condition.type == "Ready" and condition.status != "True":
-                            ready = False
-                            break
+                        if condition.type == "Ready":
+                            ready_conditions.append(f"{condition.type}={condition.status}")
+                            if condition.status != "True":
+                                ready = False
+                                break
+
+                    activity.logger.debug(f"Pod {pod_name} conditions: {', '.join(ready_conditions) if ready_conditions else 'None'}")
 
                     if ready:
-                        current_time = time.time()
                         if pod_ready_time is None:
                             pod_ready_time = current_time
-                            activity.logger.info(f"Pod {pod_name} is ready, waiting for stability...")
+                            activity.logger.info(f"Pod {pod_name} is ready, waiting for stability ({min_ready_duration}s)...")
+                            activity.heartbeat({
+                                "status": "pod_ready_waiting_stability",
+                                "pod": pod_name,
+                                "stability_duration": min_ready_duration
+                            })
                         elif current_time - pod_ready_time >= min_ready_duration:
-                            activity.logger.info(f"Pod {pod_name} has been stable for {current_time - pod_ready_time:.1f}s")
+                            stable_duration = current_time - pod_ready_time
+                            activity.logger.info(f"Pod {pod_name} has been stable for {stable_duration:.1f}s")
+                            activity.heartbeat({"status": "pod_stable", "pod": pod_name, "stable_duration": stable_duration})
                             return
                     else:
+                        if pod_ready_time is not None:
+                            activity.logger.debug(f"Pod {pod_name} became not ready, resetting stability timer")
                         pod_ready_time = None
+                elif pod.status.phase in ["Pending", "ContainerCreating"]:
+                    activity.logger.debug(f"Pod {pod_name} is {pod.status.phase}, continuing to wait...")
+                    pod_ready_time = None
+                elif pod.status.phase == "Failed":
+                    # Pod failed - this is a terminal condition, don't retry
+                    error_msg = f"Pod {pod_name} is in terminal state: Failed. This indicates the pod startup failed and needs investigation."
+                    activity.logger.error(error_msg)
+                    # Check pod events or status for more details
+                    try:
+                        if pod.status.container_statuses:
+                            for container_status in pod.status.container_statuses:
+                                if container_status.state and container_status.state.waiting:
+                                    error_msg += f" Container {container_status.name} waiting: {container_status.state.waiting.reason}"
+                                elif container_status.state and container_status.state.terminated:
+                                    error_msg += f" Container {container_status.name} terminated: {container_status.state.terminated.reason}"
+                    except Exception:
+                        pass  # Don't fail on status parsing
+                    from .state_machines import ResourceNotFoundError
+                    raise ResourceNotFoundError(error_msg)
+                elif pod.status.phase == "Succeeded":
+                    # Pod succeeded but that's not what we want for a long-running service
+                    error_msg = f"Pod {pod_name} completed successfully but should be a long-running service"
+                    activity.logger.warning(error_msg)
+                    from .state_machines import ConfigurationError
+                    raise ConfigurationError(error_msg)
+                else:
+                    activity.logger.warning(f"Pod {pod_name} is in unexpected phase: {pod.status.phase}")
+                    pod_ready_time = None
 
             except ApiException as e:
-                activity.logger.warning(f"Error checking pod status: {e}")
+                consecutive_errors += 1
+                activity.logger.warning(f"API error checking pod {pod_name} status (attempt {consecutive_errors}): {e}")
+
+                if consecutive_errors >= max_consecutive_errors:
+                    error_msg = f"Too many consecutive API errors ({consecutive_errors}) checking pod {pod_name}"
+                    activity.logger.error(error_msg)
+                    raise Exception(error_msg)
+
                 pod_ready_time = None
 
-            await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                activity.logger.warning(f"Pod ready check for {pod_name} was cancelled after {elapsed:.1f}s")
+                raise
 
-        raise TimeoutError(f"Pod {pod_name} did not become ready within {timeout} seconds")
+            except Exception as e:
+                consecutive_errors += 1
+                activity.logger.warning(f"Unexpected error checking pod {pod_name} (attempt {consecutive_errors}): {e}")
+
+                if consecutive_errors >= max_consecutive_errors:
+                    error_msg = f"Too many consecutive errors ({consecutive_errors}) checking pod {pod_name}: {e}"
+                    activity.logger.error(error_msg)
+                    raise Exception(error_msg)
+
+                pod_ready_time = None
+
+            try:
+                # Sleep for 5 seconds before next check (shorter interval for better responsiveness)
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                elapsed = time.time() - start_time
+                activity.logger.info(f"Pod ready wait for {pod_name} was cancelled during sleep after {elapsed:.1f}s")
+                activity.heartbeat({"status": "cancelled_during_sleep", "pod": pod_name, "elapsed": elapsed})
+                raise
+
+        # Timeout reached
+        elapsed = time.time() - start_time
+        error_msg = f"Pod {pod_name} did not become ready within {timeout} seconds (elapsed: {elapsed:.1f}s)"
+        activity.logger.error(error_msg)
+        raise TimeoutError(error_msg)
 
     @activity.defn
     async def check_cluster_health(self, input_data: HealthCheckInput) -> HealthCheckResult:
         """
         Check the health of a CrateDB cluster.
 
+        This activity now handles different health states and raises appropriate exceptions
+        for non-GREEN states, allowing Temporal's retry policy to handle retries.
+
         Args:
             input_data: Health check parameters
 
         Returns:
-            HealthCheckResult with health status
+            HealthCheckResult with health status if GREEN
+
+        Raises:
+            Exception: For non-GREEN states (will be retried by Temporal)
         """
         cluster = input_data.cluster
         # Use None for timestamps to avoid datetime.now() issues
         checked_at = None
+
+        # Send heartbeat for health check start
+        activity.heartbeat({"status": "checking_health", "cluster": cluster.name})
 
         try:
             self._ensure_kube_client()
@@ -955,6 +1113,9 @@ class CrateDBActivities:
 
             activity.logger.info(f"Cluster {cluster.name} health: {health}")
 
+            # Send heartbeat with current health status
+            activity.heartbeat({"status": "health_checked", "cluster": cluster.name, "health": health})
+
             # Handle different health statuses
             if health == "GREEN":
                 return HealthCheckResult(
@@ -963,32 +1124,37 @@ class CrateDBActivities:
                     is_healthy=True,
                     checked_at=checked_at,
                 )
-            elif health in ["YELLOW", "RED", "UNREACHABLE", "UNKNOWN"]:
-                # These are temporary states that should trigger retries
-                activity.logger.info(f"Cluster {cluster.name} health is {health}, retrying until GREEN...")
-                raise Exception(f"Cluster {cluster.name} health is {health}, retrying...")
             else:
-                # Unknown health states - return as unhealthy but don't retry
-                activity.logger.error(f"Cluster {cluster.name} has unknown health status: {health}")
-                return HealthCheckResult(
-                    cluster_name=cluster.name,
-                    health_status=health,
-                    is_healthy=False,
-                    checked_at=checked_at,
-                )
+                # For non-GREEN states, raise an exception so Temporal can retry
+                # This allows the retry policy to handle different states appropriately
+                error_msg = f"Cluster {cluster.name} health is {health}, expected GREEN"
+                activity.logger.warning(error_msg)
+
+                # Different exception types for different states
+                if health == "RED":
+                    raise Exception(error_msg)
+                elif health == "YELLOW":
+                    raise Exception(error_msg)
+                elif health == "UNKNOWN":
+                    raise Exception(error_msg)
+                else:
+                    raise Exception(error_msg)
+
+        except ApiException as e:
+            error_msg = f"API error checking health of cluster {cluster.name}: {e}"
+            activity.logger.error(error_msg)
+            activity.heartbeat({"status": "health_check_failed", "cluster": cluster.name, "error": "api_error"})
+            raise Exception(error_msg)
 
         except Exception as e:
-            error_msg = f"Error checking cluster health: {e}"
-            activity.logger.error(error_msg)
-            activity.logger.debug(f"Health check exception details for {cluster.name}: {type(e).__name__}: {str(e)}")
+            # Re-raise our own exceptions
+            if "health is" in str(e) or "API error" in str(e):
+                raise
 
-            return HealthCheckResult(
-                cluster_name=cluster.name,
-                health_status="UNKNOWN",
-                is_healthy=False,
-                checked_at=checked_at,
-                error=error_msg,
-            )
+            error_msg = f"Unexpected error checking health of cluster {cluster.name}: {e}"
+            activity.logger.error(error_msg)
+            activity.heartbeat({"status": "health_check_failed", "cluster": cluster.name, "error": "unexpected_error"})
+            raise Exception(error_msg)
 
     @activity.defn
     async def check_maintenance_window(self, input_data: MaintenanceWindowCheckInput) -> MaintenanceWindowCheckResult:
@@ -1090,20 +1256,33 @@ class CrateDBActivities:
     async def delete_pod(self, input_data: PodRestartInput) -> bool:
         """
         Delete a pod with proper grace period.
-        
+
         Args:
             input_data: Pod restart parameters
-            
+
         Returns:
             True if successful
         """
         try:
             self._ensure_kube_client()
-            
+
             if input_data.dry_run:
                 activity.logger.info(f"[DRY RUN] Would delete pod {input_data.pod_name}")
                 return True
+
+            # CRITICAL: Check cluster health before pod deletion
+            # Only GREEN status is safe for pod deletion operations
+            activity.logger.info(f"Checking cluster health before deleting pod {input_data.pod_name}")
             
+            health_input = HealthCheckInput(
+                cluster=input_data.cluster,
+                dry_run=False,
+                timeout=60
+            )
+            
+            health_result = await self.check_cluster_health(health_input)
+            activity.logger.info(f"Cluster health validated: {health_result.health_status}")
+
             # Calculate grace period based on cluster configuration
             grace_period = 30
             if input_data.cluster.has_dc_util:
@@ -1112,17 +1291,17 @@ class CrateDBActivities:
                 activity.logger.info(f"Deleting pod {input_data.pod_name} - preStop hook will handle decommission")
             else:
                 activity.logger.info(f"Manual decommission completed, now deleting pod {input_data.pod_name}")
-            
+
             await asyncio.to_thread(
                 self.core_v1.delete_namespaced_pod,
                 name=input_data.pod_name,
                 namespace=input_data.namespace,
                 grace_period_seconds=grace_period
             )
-            
+
             activity.logger.info(f"Successfully deleted pod {input_data.pod_name}")
             return True
-            
+
         except Exception as e:
             error_msg = f"Failed to delete pod {input_data.pod_name}: {e}"
             activity.logger.error(error_msg)
@@ -1131,79 +1310,98 @@ class CrateDBActivities:
     @activity.defn
     async def wait_for_pod_ready(self, input_data: PodRestartInput) -> bool:
         """
-        Wait for a pod to be ready after restart.
-        
+        Wait for a pod to be ready after restart with enhanced error handling.
+
         Args:
             input_data: Pod restart parameters
-            
+
         Returns:
             True if pod becomes ready
         """
         try:
             self._ensure_kube_client()
-            
+
+            # Send initial heartbeat with timeout info
+            activity.heartbeat({
+                "status": "starting_pod_wait",
+                "pod": input_data.pod_name,
+                "timeout": input_data.pod_ready_timeout
+            })
+
             if input_data.dry_run:
                 activity.logger.info(f"[DRY RUN] Would wait for pod {input_data.pod_name} to be ready")
-                await asyncio.sleep(5)  # Simulate wait time
+                await asyncio.sleep(2)  # Simulate some wait time
                 return True
-            
+
+            activity.logger.info(f"Waiting for pod {input_data.pod_name} to be ready (timeout: {input_data.pod_ready_timeout}s)")
+
             await self._wait_for_pod_ready(
                 input_data.pod_name,
                 input_data.namespace,
                 input_data.pod_ready_timeout
             )
-            
+
             activity.logger.info(f"Pod {input_data.pod_name} is ready")
+            activity.heartbeat({"status": "pod_ready_completed", "pod": input_data.pod_name})
             return True
-            
+
+        except asyncio.CancelledError:
+            activity.logger.warning(f"Pod ready wait for {input_data.pod_name} was cancelled")
+            activity.heartbeat({"status": "pod_ready_cancelled", "pod": input_data.pod_name})
+            raise
+        except TimeoutError as e:
+            activity.logger.error(f"Timeout waiting for pod {input_data.pod_name}: {e}")
+            activity.heartbeat({"status": "pod_ready_timeout", "pod": input_data.pod_name, "error": str(e)})
+            raise
         except Exception as e:
-            error_msg = f"Failed waiting for pod {input_data.pod_name} to be ready: {e}"
+            error_msg = f"Failed to wait for pod {input_data.pod_name}: {e}"
             activity.logger.error(error_msg)
+            activity.heartbeat({"status": "pod_ready_failed", "pod": input_data.pod_name, "error": str(e)})
             raise Exception(error_msg)
 
     @activity.defn
     async def is_pod_on_suspended_node(self, pod_name: str, namespace: str) -> bool:
         """
         Check if a pod is running on a suspended Kubernetes node.
-        
+
         Args:
             pod_name: Name of the pod to check
             namespace: Namespace of the pod
-            
+
         Returns:
             True if pod is running on a suspended node, False otherwise
         """
         try:
             self._ensure_kube_client()
-            
+
             # Get pod details to find which node it's running on
             pod = await asyncio.to_thread(
                 self.core_v1.read_namespaced_pod,
                 name=pod_name,
                 namespace=namespace
             )
-            
+
             if not pod.spec.node_name:
                 activity.logger.warning(f"Pod {pod_name} has no assigned node")
                 return False
-            
+
             node_name = pod.spec.node_name
             activity.logger.info(f"Pod {pod_name} is running on node {node_name}")
-            
+
             # Get node details to check if it's suspended
             node = await asyncio.to_thread(
                 self.core_v1.read_node,
                 name=node_name
             )
-            
+
             # Check if node is suspended (has unschedulable taint or annotation)
             is_suspended = False
-            
+
             # Check if node is marked as unschedulable
             if node.spec.unschedulable:
                 is_suspended = True
                 activity.logger.info(f"Node {node_name} is marked as unschedulable")
-            
+
             # Check for common suspension taints
             if node.spec.taints:
                 for taint in node.spec.taints:
@@ -1218,7 +1416,7 @@ class CrateDBActivities:
                         is_suspended = True
                         activity.logger.info(f"Node {node_name} has suspension taint: {taint.key}={taint.value}")
                         break
-            
+
             # Check for suspension annotations
             if node.metadata.annotations:
                 for annotation_key in [
@@ -1230,14 +1428,14 @@ class CrateDBActivities:
                         is_suspended = True
                         activity.logger.info(f"Node {node_name} has suspension annotation: {annotation_key}")
                         break
-            
+
             if is_suspended:
                 activity.logger.info(f"Pod {pod_name} is running on suspended node {node_name}")
             else:
                 activity.logger.info(f"Pod {pod_name} is running on active node {node_name}")
-                
+
             return is_suspended
-            
+
         except Exception as e:
             error_msg = f"Failed to check if pod {pod_name} is on suspended node: {e}"
             activity.logger.error(error_msg)
