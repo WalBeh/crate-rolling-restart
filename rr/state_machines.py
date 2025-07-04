@@ -460,6 +460,7 @@ class ClusterRestartStateMachine:
         """
         start_time = workflow.now()
         restarted_pods = []
+        skipped_pods = []
 
         # Handle case where cluster might be a dict due to serialization issues
         if isinstance(cluster, dict):
@@ -549,6 +550,36 @@ class ClusterRestartStateMachine:
             workflow.logger.info(f"[STATE: POD_RESTARTS] Restarting {len(cluster.pods)} pods for {cluster.name}")
 
             for i, pod_name in enumerate(cluster.pods):
+                workflow.logger.info(f"[STATE: POD_RESTARTS] Checking pod {i+1}/{len(cluster.pods)}: {pod_name}")
+
+                # Check if we should only restart pods on suspended nodes
+                if options.only_on_suspended_nodes:
+                    workflow.logger.info(f"[STATE: POD_RESTARTS] Checking if pod {pod_name} is on suspended node")
+                    
+                    try:
+                        is_on_suspended_node = await workflow.execute_activity(
+                            "is_pod_on_suspended_node",
+                            args=[pod_name, cluster.namespace],
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=RetryPolicy(
+                                initial_interval=timedelta(seconds=1),
+                                maximum_interval=timedelta(seconds=5),
+                                maximum_attempts=3,
+                            ),
+                        )
+                        
+                        if not is_on_suspended_node:
+                            workflow.logger.info(f"[STATE: POD_RESTARTS] Skipping pod {pod_name} - not on suspended node")
+                            skipped_pods.append(pod_name)
+                            continue
+                            
+                        workflow.logger.info(f"[STATE: POD_RESTARTS] Pod {pod_name} is on suspended node, proceeding with restart")
+                    except Exception as e:
+                        workflow.logger.error(f"[STATE: POD_RESTARTS] Failed to check node status for pod {pod_name}: {e}")
+                        workflow.logger.info(f"[STATE: POD_RESTARTS] Skipping pod {pod_name} due to node check failure")
+                        skipped_pods.append(pod_name)
+                        continue
+
                 workflow.logger.info(f"[STATE: POD_RESTARTS] Restarting pod {i+1}/{len(cluster.pods)}: {pod_name}")
 
                 pod_input = PodRestartInput(
@@ -573,7 +604,8 @@ class ClusterRestartStateMachine:
                 restarted_pods.append(pod_name)
                 workflow.logger.info(f"[STATE: POD_RESTARTS] Successfully restarted pod {pod_name}")
 
-                # Health check after each pod restart (except the last one)
+                # Health check after each pod restart (except the last pod in the list)
+                # We do this conservatively to ensure cluster stability
                 if i < len(cluster.pods) - 1:
                     workflow.logger.info(f"[STATE: POD_RESTARTS] Health check after restarting {pod_name}")
 
@@ -590,23 +622,32 @@ class ClusterRestartStateMachine:
 
                     workflow.logger.info(f"[STATE: POD_RESTARTS] Health check passed after restarting {pod_name}")
 
-            # STATE 5: FINAL_HEALTH - Final health check
-            workflow.logger.info(f"[STATE: FINAL_HEALTH] Performing final health check for {cluster.name}")
+            # STATE 5: FINAL_HEALTH - Final health check (only if pods were restarted)
+            if restarted_pods:
+                workflow.logger.info(f"[STATE: FINAL_HEALTH] Performing final health check for {cluster.name}")
 
-            await workflow.execute_child_workflow(
-                HealthCheckStateMachine.run,
-                args=[health_input],
-                id=f"final-health-{cluster.name}-{workflow.now().timestamp()}",
-                task_timeout=timedelta(seconds=600),  # 10 minutes max
-            )
+                await workflow.execute_child_workflow(
+                    HealthCheckStateMachine.run,
+                    args=[health_input],
+                    id=f"final-health-{cluster.name}-{workflow.now().timestamp()}",
+                    task_timeout=timedelta(seconds=600),  # 10 minutes max
+                )
 
-            workflow.logger.info(f"[STATE: FINAL_HEALTH] Final health check passed for {cluster.name}")
+                workflow.logger.info(f"[STATE: FINAL_HEALTH] Final health check passed for {cluster.name}")
+            else:
+                workflow.logger.info(f"[STATE: FINAL_HEALTH] Skipping final health check - no pods were restarted")
 
             # STATE 6: COMPLETE
             end_time = workflow.now()
             duration = (end_time - start_time).total_seconds()
 
-            workflow.logger.info(f"[STATE: COMPLETE] Cluster restart completed for {cluster.name} in {duration:.2f}s")
+            # Log summary of restart operation
+            if skipped_pods:
+                workflow.logger.info(f"[STATE: COMPLETE] Cluster restart completed for {cluster.name} in {duration:.2f}s")
+                workflow.logger.info(f"[STATE: COMPLETE] Restarted {len(restarted_pods)} pods, skipped {len(skipped_pods)} pods")
+                workflow.logger.info(f"[STATE: COMPLETE] Skipped pods: {', '.join(skipped_pods)}")
+            else:
+                workflow.logger.info(f"[STATE: COMPLETE] Cluster restart completed for {cluster.name} in {duration:.2f}s")
 
             return {
                 "cluster": cluster,

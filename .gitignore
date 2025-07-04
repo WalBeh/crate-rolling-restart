@@ -235,3 +235,5 @@ scratch_*.py
 # Test result files
 test_results/
 *.test.log
+
+zed/

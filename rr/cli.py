@@ -176,7 +176,7 @@ def generate_report(result, output_format: str = "text") -> str:
 
 async def async_main(cluster_names, kubeconfig, context, dry_run, skip_hook_warning,
                     output_format, log_level, temporal_address, task_queue, async_execution,
-                    maintenance_config, ignore_maintenance_windows):
+                    maintenance_config, ignore_maintenance_windows, only_on_suspended_nodes):
     """Async main function that handles the Temporal workflow execution."""
     current_log_level = setup_logging(log_level)
 
@@ -238,6 +238,7 @@ async def async_main(cluster_names, kubeconfig, context, dry_run, skip_hook_warn
             log_level=log_level,
             maintenance_config_path=maintenance_config,
             ignore_maintenance_windows=ignore_maintenance_windows,
+            only_on_suspended_nodes=only_on_suspended_nodes,
         )
 
         # Connect to Temporal
@@ -404,9 +405,14 @@ def cli(ctx):
     is_flag=True,
     help="Ignore maintenance windows and proceed with restart immediately",
 )
+@click.option(
+    "--only-on-suspended-nodes",
+    is_flag=True,
+    help="Only restart pods running on suspended Kubernetes nodes",
+)
 def restart(cluster_names, kubeconfig, context, dry_run, skip_hook_warning, 
            output_format, log_level, temporal_address, task_queue, async_execution,
-           maintenance_config, ignore_maintenance_windows):
+           maintenance_config, ignore_maintenance_windows, only_on_suspended_nodes):
     """Restart CrateDB clusters with Temporal workflows.
 
     CLUSTER_NAMES: Space-separated list of CrateDB cluster names to restart.
@@ -419,12 +425,13 @@ def restart(cluster_names, kubeconfig, context, dry_run, skip_hook_warning,
       rr restart --context prod --async cluster1         # Start restart asynchronously
       rr restart --context prod --maintenance-config maintenance-windows.toml cluster1  # Use maintenance windows
       rr restart --context prod --ignore-maintenance-windows cluster1  # Ignore maintenance windows
+      rr restart --context prod --only-on-suspended-nodes cluster1  # Only restart pods on suspended nodes
     """
     
     asyncio.run(async_main(
         cluster_names, kubeconfig, context, dry_run, skip_hook_warning,
         output_format, log_level, temporal_address, task_queue, async_execution,
-        maintenance_config, ignore_maintenance_windows
+        maintenance_config, ignore_maintenance_windows, only_on_suspended_nodes
     ))
 
 
